@@ -9,6 +9,7 @@ from config import settings
 from .schemas import GroundingPacket
 
 
+# Extracts a destination name from the user's request using common linguistic patterns
 def extract_destination_hint(request_text: str) -> str:
     patterns = [
         r"\bto\s+([A-Z][a-zA-Z\s\-]+)",
@@ -22,6 +23,7 @@ def extract_destination_hint(request_text: str) -> str:
     return "Requested destination"
 
 
+# Converts a destination name into geographic coordinates and country codes using Open-Meteo
 async def _geocode_destination(destination: str) -> dict[str, Any] | None:
     url = "https://geocoding-api.open-meteo.com/v1/search"
     params = {"name": destination, "count": 1, "language": "en", "format": "json"}
@@ -35,6 +37,7 @@ async def _geocode_destination(destination: str) -> dict[str, Any] | None:
     return results[0] if results else None
 
 
+# Fetches a 5-day weather forecast summary for a specific coordinate pair
 async def _fetch_weather_summary(latitude: float, longitude: float) -> str:
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
@@ -68,6 +71,7 @@ async def _fetch_weather_summary(latitude: float, longitude: float) -> str:
     )
 
 
+# Retrieves official travel safety advisories based on a country code
 async def _fetch_safety_summary(country_code: str) -> tuple[str, str, str]:
     url = "https://www.travel-advisory.info/api"
 
@@ -97,6 +101,7 @@ async def _fetch_safety_summary(country_code: str) -> tuple[str, str, str]:
     return summary, str(level), source
 
 
+# Gathers generic snippets from a list of configured external travel API endpoints
 async def _fetch_external_api_snippets(request_text: str, destination: str) -> list[str]:
     if not settings.travel_api_endpoints:
         return []
@@ -160,10 +165,129 @@ async def _fetch_rapidapi_source_snippet(
         return f"{source_name}: API unavailable ({ex})"
 
 
+async def _fetch_hotel_search_results(
+    destination: str,
+    hotel_params: dict[str, Any] | None = None,
+) -> str:
+    """
+    Implements the two-step hotel search:
+    1. searchLocation -> get documentId
+    2. searchHotels -> get hotel details using geoId (documentId)
+    """
+    if not settings.rapidapi_key:
+        return "Hotel search unavailable: RAPIDAPI_KEY missing."
+
+    host = "tripadvisor16.p.rapidapi.com"
+    location_url = "https://tripadvisor16.p.rapidapi.com/api/v1/hotels/searchLocation"
+    search_url = "https://tripadvisor16.p.rapidapi.com/api/v1/hotels/searchHotels"
+
+    try:
+        async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+            # Step 1: Search for location code
+            loc_response = await client.get(
+                location_url,
+                params={"query": destination},
+                headers=_rapidapi_headers(host),
+            )
+            loc_response.raise_for_status()
+            loc_data = loc_response.json()
+
+            # Extract documentId (assuming it's in the first result)
+            # The API response structure usually has a list of locations
+            results = loc_data.get("data", [])
+            if not results:
+                return f"Hotel search failed: No location found for {destination}."
+
+            document_id = results[0].get("documentId")
+            if not document_id:
+                return f"Hotel search failed: No documentId found for {destination}."
+
+            # Step 2: Search for hotels using geoId
+            hotel_params_to_use = hotel_params or {}
+            hotel_params_to_use["geoId"] = document_id
+            if "currencyCode" not in hotel_params_to_use:
+                hotel_params_to_use["currencyCode"] = settings.default_currency
+
+            hotel_response = await client.get(
+                search_url,
+                params=hotel_params_to_use,
+                headers=_rapidapi_headers(host),
+            )
+            hotel_response.raise_for_status()
+            hotel_data = hotel_response.json()
+
+            return f"Tripadvisor Hotels ({destination}): {str(hotel_data)[:2000]}"
+
+    except Exception as ex:
+        return f"Hotel search unavailable: {ex}"
+
+
+async def _fetch_cruise_search_results(
+    destination: str,
+    cruise_params: dict[str, Any] | None = None,
+) -> str:
+    """
+    Implements the two-step cruise search:
+    1. getLocation -> get destinationId
+    2. searchCruises -> get cruise details using destinationId
+    """
+    if not settings.rapidapi_key:
+        return "Cruise search unavailable: RAPIDAPI_KEY missing."
+
+    host = "tripadvisor16.p.rapidapi.com"
+    location_url = "https://tripadvisor16.p.rapidapi.com/api/v1/cruises/getLocation"
+    search_url = "https://tripadvisor16.p.rapidapi.com/api/v1/cruises/searchCruises"
+
+    try:
+        async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+            # Step 1: Search for cruise location
+            loc_response = await client.get(
+                location_url,
+                params={"query": destination},
+                headers=_rapidapi_headers(host),
+            )
+            loc_response.raise_for_status()
+            loc_data = loc_response.json()
+
+            # Extract destinationId from the "data" list
+            results = loc_data.get("data", [])
+            if not results:
+                return f"Cruise search failed: No cruise location found for {destination}."
+
+            # The user specified that the location is under "name" in "data"
+            # We need to find the one that matches the destination or just take the first relevant one
+            # For simplicity, we take the first result's ID if available
+            destination_id = results[0].get("documentId") or results[0].get("id")
+            if not destination_id:
+                return f"Cruise search failed: No destinationId found for {destination}."
+
+            # Step 2: Search for cruises using destinationId
+            cruise_params_to_use = cruise_params or {}
+            cruise_params_to_use["destinationId"] = destination_id
+            if "currencyCode" not in cruise_params_to_use:
+                cruise_params_to_use["currencyCode"] = settings.default_currency
+
+            cruise_response = await client.get(
+                search_url,
+                params=cruise_params_to_use,
+                headers=_rapidapi_headers(host),
+            )
+            cruise_response.raise_for_status()
+            cruise_data = cruise_response.json()
+
+            return f"Tripadvisor Cruises ({destination}): {str(cruise_data)[:2000]}"
+
+    except Exception as ex:
+        return f"Cruise search unavailable: {ex}"
+
+
 async def _fetch_rapidapi_snippets(
     request_text: str,
     destination: str,
     country_code: str | None,
+    flight_params: dict[str, Any] | None = None,
+    hotel_params: dict[str, Any] | None = None,
+    cruise_params: dict[str, Any] | None = None,
 ) -> list[str]:
     common_params = {
         "query": request_text,
@@ -186,6 +310,12 @@ async def _fetch_rapidapi_snippets(
         "destination": destination,
     }
 
+    # Use flight_params if provided, otherwise fallback to common_params
+    flight_params_to_use = flight_params if flight_params else common_params
+
+    hotel_results = await _fetch_hotel_search_results(destination, hotel_params)
+    cruise_results = await _fetch_cruise_search_results(destination, cruise_params) if cruise_params is not None else "Cruise search disabled."
+
     results = [
         await _fetch_rapidapi_source_snippet(
             "Tripadvisor",
@@ -203,13 +333,13 @@ async def _fetch_rapidapi_snippets(
             "Flights Scraper Sky",
             flights_sky.get("url", ""),
             flights_sky.get("host", ""),
-            common_params,
+            flight_params_to_use,
         ),
         await _fetch_rapidapi_source_snippet(
             "Google Flights",
             google_flights.get("url", ""),
             google_flights.get("host", ""),
-            common_params,
+            flight_params_to_use,
         ),
         await _fetch_rapidapi_source_snippet(
             "Visa Requirements",
@@ -218,6 +348,9 @@ async def _fetch_rapidapi_snippets(
             visa_params,
         ),
     ]
+
+    results.append(hotel_results)
+    results.append(cruise_results)
 
     return results
 
@@ -230,7 +363,9 @@ def _build_local_transport_notes(destination: str) -> str:
     )
 
 
-async def gather_grounding_packet(request_text: str) -> GroundingPacket:
+async def gather_grounding_packet(
+    request_text: str, flight_params: dict[str, Any] | None = None, hotel_params: dict[str, Any] | None = None, cruise_params: dict[str, Any] | None = None
+) -> GroundingPacket:
     destination = extract_destination_hint(request_text)
 
     weather_summary = "Weather data unavailable."
@@ -264,6 +399,9 @@ async def gather_grounding_packet(request_text: str) -> GroundingPacket:
         request_text=request_text,
         destination=destination,
         country_code=country_code,
+        flight_params=flight_params,
+        hotel_params=hotel_params,
+        cruise_params=cruise_params,
     )
 
     if settings.travel_api_endpoints:

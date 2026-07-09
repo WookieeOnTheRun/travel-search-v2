@@ -11,13 +11,17 @@ from travel_agent import build_itineraries
 from travel_agent.schemas import UserTripRequest
 
 
+# Helper to parse a single markdown table row into a list of cells
 def _parse_markdown_row(row: str) -> list[str]:
     return [cell.strip() for cell in row.strip().strip("|").split("|")]
 
 
+# Extracts the 'Deterministic Scoring Table' from the agent's markdown response
+# and converts it into a list of structured dictionaries for display/analysis.
 def _extract_scoring_table(markdown_text: str) -> list[dict[str, Any]]:
     lines = markdown_text.splitlines()
     heading_index = -1
+
 
     for index, line in enumerate(lines):
         if re.search(r"deterministic\s+scoring\s+table", line, flags=re.IGNORECASE):
@@ -74,6 +78,7 @@ def _extract_scoring_table(markdown_text: str) -> list[dict[str, Any]]:
 
     return records
 
+# UI Configuration and Page Setup
 st.set_page_config(page_title="Agentic Travel Concierge", page_icon="🧳", layout="wide")
 
 st.title("🧳 Agentic Travel Concierge")
@@ -86,6 +91,7 @@ if ENV_FILE_IN_USE:
 else:
     st.caption("ENV file in use: default process environment (no env file found)")
 
+# User Input Form for Trip Requests
 with st.form("trip_form"):
     request_text = st.text_area(
         "Travel request",

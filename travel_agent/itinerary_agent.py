@@ -9,13 +9,16 @@ from agent_framework.openai import OpenAIChatClient
 from config import settings
 from .data_sources import gather_grounding_packet
 from .schemas import UserTripRequest
+from .search_agents import HotelSearchAgent, FlightSearchAgent, VisaSearchAgent, AirportSearchAgent, CruiseSearchAgent
 
 
+# Sets the necessary OpenAI environment variables from the application settings
 def _configure_model_env() -> None:
     for key, value in settings.openai_env.items():
         os.environ[key] = value
 
 
+# Defines the strict scoring logic used by the ConciergeSynthesizer to rank itinerary options
 def _deterministic_ranking_rubric() -> str:
         return dedent(
                 """
@@ -51,11 +54,19 @@ def _deterministic_ranking_rubric() -> str:
         ).strip()
 
 
+# Main orchestration function that coordinates multiple specialist agents to build a complete trip plan
 async def build_itineraries(user_request: UserTripRequest) -> dict[str, str]:
     _configure_model_env()
     grounding = await gather_grounding_packet(user_request.request_text)
 
     client = OpenAIChatClient()
+
+
+    hotel_agent = HotelSearchAgent(client)
+    flight_agent = FlightSearchAgent(client)
+    visa_agent = VisaSearchAgent(client)
+    airport_agent = AirportSearchAgent(client)
+    cruise_agent = CruiseSearchAgent(client)
 
     safety_agent = Agent(
         name="SafetyAgent",
@@ -103,6 +114,73 @@ async def build_itineraries(user_request: UserTripRequest) -> dict[str, str]:
         ).strip(),
     )
 
+    hotel_search_results = await hotel_agent.run(
+        dedent(
+            f"""
+            Traveler request: {user_request.request_text}
+            Destination: {grounding.destination_hint}
+            API Data: {grounding.external_api_snippets or 'No data'}
+            
+            Hotel Search Requirements:
+            - Use 'primaryInfo' and 'secondaryInfo' for the property summary.
+            - Include image details from 'cardPhotos' (urlTemplate, maxHeight, maxWidth).
+            - Use '_typename' (e.g., 'AppPresentation_PhotoItemSizeDynamic') for dynamic image display logic.
+            
+            Find the best hotel options.
+            """
+        ).strip()
+    )
+
+    flight_search_results = await flight_agent.run(
+        dedent(
+            f"""
+            Traveler request: {user_request.request_text}
+            Origin: {user_request.origin_city or 'Not provided'}
+            Destination: {grounding.destination_hint}
+            API Data: {grounding.external_api_snippets or 'No data'}
+            
+            Flight Search Parameters to consider:
+            - sourceAirportCode, destinationAirportCode, date, itineraryType (ONE_WAY/ROUND_TRIP), numAdults, numSeniors, classOfService (ECONOMY, PREMIUM_ECONOMY, BUSINESS, FIRST), returnDate, nearby, nonstop, currencyCode.
+            
+            Find the best flight options.
+            """
+        ).strip()
+    )
+
+    visa_search_results = await visa_agent.run(
+        dedent(
+            f"""
+            Traveler request: {user_request.request_text}
+            Destination: {grounding.destination_hint}
+            Country Code: {grounding.advisory_level}
+            API Data: {grounding.external_api_snippets or 'No data'}
+            Find visa and entry requirements.
+            """
+        ).strip()
+    )
+
+    airport_search_results = await airport_agent.run(
+        dedent(
+            f"""
+            Traveler request: {user_request.request_text}
+            Destination: {grounding.destination_hint}
+            API Data: {grounding.external_api_snippets or 'No data'}
+            Find the most suitable airports for this destination.
+            """
+        ).strip()
+    )
+
+    cruise_search_results = await cruise_agent.run(
+        dedent(
+            f"""
+            Traveler request: {user_request.request_text}
+            Destination: {grounding.destination_hint}
+            API Data: {grounding.external_api_snippets or 'No data'}
+            Find the best cruise options. Translate technical logistics into user-friendly summaries.
+            """
+        ).strip()
+    )
+
     safety_brief = await safety_agent.run(
         dedent(
             f"""
@@ -125,6 +203,21 @@ async def build_itineraries(user_request: UserTripRequest) -> dict[str, str]:
             Weather grounding: {grounding.weather_summary}
             Transport grounding: {grounding.local_transport_notes}
             External API data: {grounding.external_api_snippets or 'No external API snippets provided'}
+            
+            Hotel Search Results:
+            {hotel_search_results}
+            
+            Flight Search Results:
+            {flight_search_results}
+            
+            Visa Requirements:
+            {visa_search_results}
+
+            Airport Recommendations:
+            {airport_search_results}
+
+            Cruise Search Results:
+            {cruise_search_results}
             """
         ).strip()
     )

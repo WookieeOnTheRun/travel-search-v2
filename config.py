@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 
+# Environment loading logic to find and load .env files from multiple candidate paths
 def _load_environment() -> Path | None:
     project_root = Path(__file__).resolve().parent
     explicit_env_path = os.getenv("TRAVEL_AGENT_ENV_FILE", "").strip()
@@ -33,9 +34,11 @@ def _load_environment() -> Path | None:
     return None
 
 
+
 ENV_FILE_IN_USE = _load_environment()
 
 
+# Standard keys used across different travel API providers for consistent lookup
 LOOKUP_ROUTE_KEYS: List[str] = [
     "AIRPORT_LOOKUP",
     "FLIGHT_LOOKUP",
@@ -51,8 +54,10 @@ LOOKUP_ROUTE_KEYS: List[str] = [
 ]
 
 
+# Helper to ensure all required lookup keys are present in a provider's configuration
 def _build_lookup_dictionary(defaults: Dict[str, str]) -> Dict[str, str]:
     return {key: defaults.get(key, "") for key in LOOKUP_ROUTE_KEYS}
+
 
 
 TRIPADVISOR_API_LOOKUP_PATHS: Dict[str, str] = _build_lookup_dictionary(
