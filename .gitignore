@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local secrets — never commit real credentials.
+.env
+travel_agent/main.env

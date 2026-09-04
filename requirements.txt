@@ -1,6 +1,7 @@
-agent-framework-core==1.0.0rc2
-agent-framework-azure-ai==1.0.0rc2
+agent-framework-core==1.17.0
+agent-framework-ollama==1.0.0b260813
 streamlit==1.43.2
 httpx==0.28.1
 pydantic==2.11.1
 python-dotenv==1.0.1
+python-dateutil==2.9.0.post0
