@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.claude/
 
 # Local secrets — never commit real credentials.
 .env

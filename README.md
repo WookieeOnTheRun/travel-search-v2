@@ -20,29 +20,35 @@ This project builds a travel concierge workflow that:
 - recommends local transportation options,
 - prioritizes luxury experience within budget and traveler safety.
 
-Flight search and hotel/accommodation search both run against the **Duffel API**
-(`https://api.duffel.com`, `Duffel-Version: v2` -- verified against the official docs at
-https://duffel.com/docs/api on 2026-09-04; see `travel_agent/location_resolution.py` and
-`travel_agent/data_sources.py` for the exact endpoints/parameters):
+Flight search, hotel/accommodation search, and cruise search all run against the
+**Tripadvisor API via RapidAPI** (`tripadvisor16.p.rapidapi.com` -- endpoint paths and
+parameter contracts verified against the live API on 2026-09-08; see
+`travel_agent/location_resolution.py` and `travel_agent/data_sources.py` for the exact
+endpoints/parameters):
 
 | Source | Used for |
 |---|---|
-| Duffel Places (`GET /places/suggestions`) | Airport code resolution (origin + destination), matched by ISO country code for real disambiguation |
-| Duffel Flights (`POST /air/offer_requests`) | Flight search (one-way or round-trip, by resolved IATA airport codes) |
-| Duffel Stays (`POST /stays/search`) | Hotel/accommodation search, by the destination's geocoded coordinates + a radius |
+| Tripadvisor Hotels (`GET /api/v1/hotels/searchLocation` + `GET /api/v1/hotels/searchHotels`) | Hotel/accommodation search, by a resolved Tripadvisor `geoId` for the destination -- verified working end-to-end |
+| Tripadvisor Flights (`GET /api/v1/flights/searchAirport` + `GET /api/v1/flights/searchFlights`) | Airport code resolution and flight search, by resolved IATA airport codes -- endpoint paths and parameter names are verified, but see the reliability note below |
+| Tripadvisor Cruises (`GET /api/v1/cruises/getLocation` + `GET /api/v1/cruises/searchCruises`) | Cruise search (currently failing server-side on this product -- see note below) |
 
-A remaining couple of sources stay on RapidAPI, since Duffel doesn't cover them:
+A separate RapidAPI host handles the one thing Tripadvisor doesn't cover:
 
 | Source | Used for |
 |---|---|
-| Tripadvisor (`tripadvisor16.p.rapidapi.com`) | Cruise search only (currently failing server-side on this product -- see note below) |
 | Visa Requirements (`visa-requirement.p.rapidapi.com`) | Visa/entry requirement lookup |
 
-**Tripadvisor cruise search (`cruises/getLocation`) is currently unreliable.** The path
-is registered (not a 404) but the backend returns a generic error for every query tested,
-including real port cities. Cruise search is still wired up -- gated so it's only called
-when the request mentions cruising -- and degrades to a clear "unavailable" message rather
-than fabricating results; it will start working automatically if the upstream issue clears.
+**Tripadvisor's flight endpoints and cruise search (`cruises/getLocation`) are currently
+unreliable.** All three paths are registered (not 404s) and their request parameters are
+verified against the live API's own validation layer, but `flights/searchAirport` returns an
+empty result for every query tried, `flights/searchFlights` returns a generic server-side
+error for every syntactically valid request tried, and `cruises/getLocation` returns a
+generic error for every query tested, including real port cities. All three are still wired
+up per their real, verified contracts -- flight search is gated so it's only called when an
+origin city is given, cruise search only when the request mentions cruising -- and each
+degrades to a clear "unavailable" message rather than fabricating results; they'll start
+working automatically if the upstream issue clears. Hotel/accommodation search has no such
+issue: it's verified working end-to-end with real results.
 
 ## Destination-selection checks (`travel_agent/destination_insights.py`)
 
@@ -126,7 +132,7 @@ public service) bounded to a couple of minutes while leaving normal operation un
 ## Stack
 
 - `agent-framework-core` for agent orchestration
-- `agent-framework-ollama` for a locally-hosted Ollama model as the chat client
+- `agent-framework-ollama` (plus the `ollama` SDK directly, for Cloud auth headers) as the chat client, pointed at Ollama's cloud-hosted API
 - `streamlit` for web UI
 - `httpx` for external data grounding calls
 - `python-dateutil` for parsing a travel date out of free text
@@ -138,10 +144,11 @@ public service) bounded to a couple of minutes while leaving normal operation un
 - `app.py` Streamlit entry point (multi-step: free text -> [discover destinations if none
   named] -> confirm destination/date -> results)
 - `travel_agent/location_resolution.py` destination candidate geocoding, travel-date parsing,
-  and provider-code resolution (Duffel-resolved airport codes, Tripadvisor cruise location id)
-- `travel_agent/data_sources.py` grounding + search API calls (Duffel Flights, Duffel Stays,
-  Tripadvisor cruises, visa requirements), gated by relevance (flights only called if an origin
-  was given; cruise only if the request mentions cruising)
+  and provider-code resolution (Tripadvisor-resolved airport codes, hotel location id, and
+  cruise location id)
+- `travel_agent/data_sources.py` grounding + search API calls (Tripadvisor Flights, Tripadvisor
+  Hotels, Tripadvisor Cruises, visa requirements), gated by relevance (flights only called if an
+  origin was given; cruise only if the request mentions cruising)
 - `travel_agent/destination_insights.py` the three destination-selection checks (State
   Department advisory, weather outlook, seasonal activities) -- see above
 - `travel_agent/destination_discovery.py` "suggest a destination" search for requests that
@@ -157,12 +164,9 @@ public service) bounded to a couple of minutes while leaving normal operation un
 1. Copy `travel_agent/main.env` (or create `.env`) and set:
 
 ```env
-OLLAMA_MODEL=gemma4:31b
-OLLAMA_HOST=http://localhost:11434
-
-DUFFEL_API_KEY=
-DUFFEL_API_BASE_URL=https://api.duffel.com
-DUFFEL_API_VERSION=v2
+OLLAMA_MODEL=gemma4:cloud
+OLLAMA_HOST=https://ollama.com
+OLLAMA_API_KEY=
 
 RAPIDAPI_KEY=
 
@@ -172,10 +176,9 @@ RAPIDAPI_VISA_HOST=visa-requirement.p.rapidapi.com
 DEFAULT_CITIZENSHIP_COUNTRY_CODE=US
 ```
 
-`DUFFEL_API_KEY` is a Duffel access token from your Duffel dashboard -- use a test token
-(prefixed `duffel_test_`) for development; test-mode flight search reliably returns
-results from Duffel's own "Duffel Airways" (`ZZ`) sandbox airline rather than needing a
-real airline sandbox. See https://duffel.com/docs/api/overview/test-mode.
+`RAPIDAPI_KEY` is a RapidAPI application key subscribed to both the Tripadvisor
+(`tripadvisor16.p.rapidapi.com`) and Visa Requirements products -- get one from your RapidAPI
+dashboard.
 
 Only the RapidAPI **host** is configurable per RapidAPI provider -- endpoint paths are
 fixed, verified constants in code. A RapidAPI host maps 1:1 to one product's route
@@ -185,21 +188,35 @@ entirely and could never have returned real results). Swapping to a different un
 product for the same capability is the only thing that actually requires changing this
 config, and that's exactly what changing the host does.
 
-The LLM itself is a locally-hosted [Ollama](https://ollama.com) model, reached via
-`agent-framework-ollama`'s `OllamaChatClient`. Before running the app, make sure Ollama is
-installed and running locally and that the configured model has been pulled, e.g.:
+The LLM itself is [Ollama's cloud-hosted API](https://ollama.com) (`https://ollama.com/api`),
+reached via `agent-framework-ollama`'s `OllamaChatClient`, wired up in
+`travel_agent/itinerary_agent.py`'s `build_ollama_client()`. No local Ollama install, running
+daemon, or `ollama pull` is required -- this keeps the app's LLM dependency available
+regardless of where it's hosted (a laptop, a container, or a cloud deployment all just need
+outbound HTTPS access and a valid `OLLAMA_API_KEY`).
 
-```
-ollama pull gemma4:31b
-```
+Authentication is via an `Authorization: Bearer <OLLAMA_API_KEY>` header (verified against
+https://docs.ollama.com/api/authentication on 2026-09-08) -- `agent_framework_ollama`'s
+`OllamaChatClient` has no built-in way to attach that header itself, so `build_ollama_client()`
+constructs the underlying `ollama.AsyncClient` directly with it and passes that in.
+`OLLAMA_HOST` is the SDK's host *root* (`https://ollama.com`), not the `/api`-suffixed form
+shown in Ollama's raw HTTP/curl docs -- the ollama-python client already appends
+`/api/<endpoint>` to every call itself, so including `/api` in the host produces a broken
+`/api/api/...` path (confirmed by inspecting `ollama/_client.py` and building a real request
+against both forms).
 
-`OLLAMA_MODEL`/`OLLAMA_HOST` fall back to `gemma4:31b`/`http://localhost:11434` (Ollama's
-default port) if left unset.
+Create an API key at https://ollama.com/settings/keys and set it as `OLLAMA_API_KEY`.
+`OLLAMA_MODEL`/`OLLAMA_HOST` fall back to `gemma4:cloud`/`https://ollama.com` if left unset,
+but `OLLAMA_API_KEY` has no fallback -- `build_ollama_client()` raises a clear error if it's
+missing rather than silently failing partway through a request.
 
 2. **Never commit `main.env` or `.env`, and never paste a real key into chat, a PR, or an
-   issue.** Both are gitignored. If a key is ever exposed (committed, pasted, logged),
-   rotate it on Duffel (or RapidAPI, whichever key was exposed) immediately -- treat it as
-   compromised even if the exposure was private, since it lives on in history until rotated.
+   issue.** Both are gitignored. `OLLAMA_API_KEY` is read from that file/environment only --
+   it is never logged, and never rendered anywhere in the Streamlit UI, so it stays
+   inaccessible to users of the running app. If a key is ever exposed (committed, pasted,
+   logged), rotate it immediately on Ollama (https://ollama.com/settings/keys) or RapidAPI
+   (whichever key was exposed) -- treat it as compromised even if the exposure was private,
+   since it lives on in history until rotated.
 
 ## Run
 
@@ -219,12 +236,14 @@ streamlit run app.py
 2. You confirm one destination and a travel start date (parsed from your text if it was
    explicit there, e.g. "October 15" or "2026-11-03"; otherwise you're asked for one).
 3. Only then does the app resolve real provider codes for that confirmed destination
-   (Duffel-resolved IATA airport codes for flights) and run search:
-   - Hotel/accommodation search always runs (Duffel Stays, searched by the destination's
-     geocoded coordinates + a radius, using real `check_in_date`/`check_out_date` values).
+   (Tripadvisor-resolved IATA airport codes for flights, a Tripadvisor `geoId` for hotels)
+   and run search:
+   - Hotel/accommodation search always runs: the destination name is resolved to a Tripadvisor
+     `geoId` (`hotels/searchLocation`), then searched with real `checkIn`/`checkOut` dates
+     (`hotels/searchHotels`).
    - Flight search only runs if you gave an origin city (otherwise there's no route to search);
-     it resolves airport codes via Duffel Places, then searches via Duffel Flights
-     (`offer_requests`).
+     it resolves airport codes via `flights/searchAirport`, then searches via
+     `flights/searchFlights`.
    - Cruise search only runs if your request mentions cruising.
    - Visa search always runs, using the destination's actual country code (resolved during
      geocoding, not a guess).
@@ -236,13 +255,12 @@ calls proportional to what the request actually needs.
 ## Rate limits
 
 Live testing surfaced that firing concurrent requests at the *same* host (e.g. resolving
-origin and destination airport codes at the same time, both against Duffel Places) can
-trip that host's rate limit and come back with empty/incomplete data rather than a loud
-error. `travel_agent/http_utils.py` serializes requests per host (a lock keyed by
-hostname -- this applies equally to `api.duffel.com` and the remaining RapidAPI hosts) to
-avoid self-inflicted rate limiting -- calls to *different* hosts still run fully in
-parallel. If you see empty search results in bursts, check your Duffel/RapidAPI dashboard
-for per-product plan/quota/rate limits before assuming the code is wrong.
+origin and destination airport codes at the same time, both against Tripadvisor's flight
+airport-search endpoint) can trip that host's rate limit and come back with empty/incomplete
+data rather than a loud error. `travel_agent/http_utils.py` serializes requests per host (a
+lock keyed by hostname) to avoid self-inflicted rate limiting -- calls to *different* hosts
+still run fully in parallel. If you see empty search results in bursts, check your RapidAPI
+dashboard for per-product plan/quota/rate limits before assuming the code is wrong.
 
 The per-host lock is scoped to the *currently running* event loop, not just the hostname.
 Streamlit's `app.py` calls `asyncio.run(...)` fresh on every script rerun (every widget

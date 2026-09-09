@@ -9,13 +9,15 @@ import httpx
 
 from config import settings
 from .destination_insights import check_state_department_advisory
-from .http_utils import describe_error, duffel_headers, get_with_retry, post_with_retry, rapidapi_headers
+from .http_utils import describe_error, get_with_retry, post_with_retry, rapidapi_headers
 from .location_resolution import (
-    resolve_airport_codes,
     resolve_cruise_destination_id,
+    resolve_destination_airport_codes,
+    resolve_hotel_location_id,
     resolve_origin_airport_codes,
 )
 from .schemas import DestinationCandidate, GroundingPacket, LocationCodes
+from .units import format_temp_c
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +49,8 @@ async def _fetch_weather_summary(client: httpx.AsyncClient, latitude: float, lon
     rain_risk = round(sum(precipitation) / len(precipitation), 1) if precipitation else 0
 
     return (
-        f"5-day outlook: average highs around {avg_high}°C, lows around {avg_low}°C, "
-        f"and average precipitation probability near {rain_risk}%."
+        f"5-day outlook: average highs around {format_temp_c(avg_high)}, lows around "
+        f"{format_temp_c(avg_low)}, and average precipitation probability near {rain_risk}%."
     )
 
 
@@ -147,11 +149,12 @@ async def resolve_location_codes(
     wants_flights: bool,
     wants_cruise: bool,
 ) -> LocationCodes:
-    # No hotel/accommodation location id needs resolving here: Duffel Stays searches by
-    # geographic coordinates directly (see _fetch_duffel_stays_results below), which the
-    # destination candidate already carries from geocoding.
+    # Hotel/accommodation search always runs (see gather_grounding_packet below), so its
+    # location id is always resolved, unlike the flight/cruise ids which are gated behind
+    # request relevance.
+    hotel_location_task = asyncio.create_task(resolve_hotel_location_id(client, destination))
     dest_airport_task = (
-        asyncio.create_task(resolve_airport_codes(client, destination.name, country_hint=destination.country_code))
+        asyncio.create_task(resolve_destination_airport_codes(client, destination))
         if wants_flights
         else None
     )
@@ -162,12 +165,13 @@ async def resolve_location_codes(
     )
     cruise_task = asyncio.create_task(resolve_cruise_destination_id(client, destination)) if wants_cruise else None
 
-    pending = [t for t in (dest_airport_task, origin_airport_task, cruise_task) if t]
+    pending = [t for t in (hotel_location_task, dest_airport_task, origin_airport_task, cruise_task) if t]
     await asyncio.gather(*pending)
 
     return LocationCodes(
         destination_airport_codes=dest_airport_task.result() if dest_airport_task else [],
         origin_airport_codes=origin_airport_task.result() if origin_airport_task else [],
+        hotel_location_id=hotel_location_task.result(),
         cruise_destination_id=cruise_task.result() if cruise_task else None,
     )
 
@@ -179,49 +183,53 @@ async def resolve_location_codes(
 # ---------------------------------------------------------------------------
 
 
-# Kilometre search radius passed to Duffel Stays' location-based search (POST
-# /stays/search, `data.location.radius` in km per
-# https://duffel.com/docs/guides/getting-started-with-stays). This is a tuning parameter
-# (how wide a net to cast around the destination's geocoded center), not a verified fact,
-# and matches the value used in Duffel's own official example.
-_STAYS_SEARCH_RADIUS_KM = 2
-
-
-async def _fetch_duffel_stays_results(
+# Hotel/accommodation search: GET /api/v1/hotels/searchHotels on Tripadvisor's RapidAPI
+# product, keyed by the `geoId` resolved via resolve_hotel_location_id (hotels/searchLocation).
+# Both the request contract (query params) and the response shape (`data.data[]`, each entry
+# carrying `title`, `bubbleRating.rating`/`bubbleRating.count`, `priceForDisplay`,
+# `priceSummary`, `provider`, `secondaryInfo`, `cardPhotos`) were verified against a real,
+# live call on 2026-09-08 -- this endpoint returns genuine hotel results end-to-end.
+async def _fetch_tripadvisor_hotels_results(
     client: httpx.AsyncClient,
-    destination: DestinationCandidate,
+    hotel_location_id: str | None,
+    destination_name: str,
     check_in: date,
     check_out: date,
     traveler_count: int,
 ) -> str:
-    if not settings.duffel_api_key:
-        return "Duffel Stays: DUFFEL_API_KEY missing."
+    if not hotel_location_id:
+        return "Tripadvisor Hotels: unavailable (could not resolve a hotel location id for this destination)."
+    if not settings.rapidapi_key:
+        return "Tripadvisor Hotels: RAPIDAPI_KEY missing."
 
-    url = f"{settings.duffel_api_base_url}/stays/search"
-    payload = {
-        "data": {
-            "location": {
-                "radius": _STAYS_SEARCH_RADIUS_KM,
-                "geographic_coordinates": {
-                    "latitude": destination.latitude,
-                    "longitude": destination.longitude,
-                },
-            },
-            "check_in_date": check_in.isoformat(),
-            "check_out_date": check_out.isoformat(),
-            "rooms": 1,
-            "guests": [{"type": "adult"} for _ in range(traveler_count)],
-        }
+    host = settings.rapidapi_tripadvisor_host
+    url = f"https://{host}/api/v1/hotels/searchHotels"
+    params = {
+        "geoId": hotel_location_id,
+        "checkIn": check_in.isoformat(),
+        "checkOut": check_out.isoformat(),
+        "adults": traveler_count,
+        "rooms": 1,
+        "currencyCode": settings.default_currency,
     }
     try:
-        response = await post_with_retry(client, url, json=payload, headers=duffel_headers())
-        return f"Duffel Stays: {str(response.json())[:2000]}"
+        response = await get_with_retry(client, url, params=params, headers=rapidapi_headers(host))
+        return f"Tripadvisor Hotels ({destination_name}): {str(response.json())[:2000]}"
     except Exception as ex:
-        logger.warning("Duffel Stays search failed: %s", describe_error(ex))
-        return f"Duffel Stays: unavailable ({describe_error(ex)})"
+        logger.warning("Tripadvisor Hotels search failed: %s", describe_error(ex))
+        return f"Tripadvisor Hotels: unavailable ({describe_error(ex)})"
 
 
-async def _fetch_duffel_flight_results(
+# Flight search: GET /api/v1/flights/searchFlights on Tripadvisor's RapidAPI product. The
+# endpoint path and required, validated query parameter names/enums below (sourceAirportCode,
+# destinationAirportCode, date in ISO YYYY-MM-DD, itineraryType ONE_WAY/ROUND_TRIP,
+# classOfService ECONOMY) were verified live on 2026-09-08 -- the API's own validation layer
+# confirmed these exact names and rejected an MM/DD/YYYY date as malformed. That said, every
+# syntactically valid request tried against this endpoint on the live subscription still comes
+# back with a generic server-side error rather than flight offers, so treat this as the same
+# kind of currently-unreliable-but-real endpoint this app already carries for Tripadvisor
+# cruise search, not a sign the parameter contract itself is wrong.
+async def _fetch_tripadvisor_flight_results(
     client: httpx.AsyncClient,
     origin_codes: list[str],
     destination_codes: list[str],
@@ -230,42 +238,29 @@ async def _fetch_duffel_flight_results(
     traveler_count: int,
 ) -> str:
     if not origin_codes or not destination_codes:
-        return "Duffel Flights: unavailable (could not resolve origin/destination airport codes)."
-    if not settings.duffel_api_key:
-        return "Duffel Flights: DUFFEL_API_KEY missing."
+        return "Tripadvisor Flights: unavailable (could not resolve origin/destination airport codes)."
+    if not settings.rapidapi_key:
+        return "Tripadvisor Flights: RAPIDAPI_KEY missing."
 
-    url = f"{settings.duffel_api_base_url}/air/offer_requests"
-    slices: list[dict[str, Any]] = [
-        {
-            "origin": origin_codes[0],
-            "destination": destination_codes[0],
-            "departure_date": depart_date.isoformat(),
-        }
-    ]
-    if return_date:
-        slices.append(
-            {
-                "origin": destination_codes[0],
-                "destination": origin_codes[0],
-                "departure_date": return_date.isoformat(),
-            }
-        )
-
-    payload = {
-        "data": {
-            "slices": slices,
-            "passengers": [{"type": "adult"} for _ in range(traveler_count)],
-            "cabin_class": "economy",
-        }
+    host = settings.rapidapi_tripadvisor_host
+    url = f"https://{host}/api/v1/flights/searchFlights"
+    params: dict[str, Any] = {
+        "sourceAirportCode": origin_codes[0],
+        "destinationAirportCode": destination_codes[0],
+        "date": depart_date.isoformat(),
+        "itineraryType": "ROUND_TRIP" if return_date else "ONE_WAY",
+        "classOfService": "ECONOMY",
+        "numAdults": traveler_count,
     }
+    if return_date:
+        params["returnDate"] = return_date.isoformat()
+
     try:
-        # return_offers defaults to true, so the offer_request response already carries
-        # the matching offers -- no separate GET /air/offers call is needed.
-        response = await post_with_retry(client, url, json=payload, headers=duffel_headers())
-        return f"Duffel Flights ({origin_codes[0]} -> {destination_codes[0]}): {str(response.json())[:2000]}"
+        response = await get_with_retry(client, url, params=params, headers=rapidapi_headers(host))
+        return f"Tripadvisor Flights ({origin_codes[0]} -> {destination_codes[0]}): {str(response.json())[:2000]}"
     except Exception as ex:
-        logger.warning("Duffel Flights search failed: %s", describe_error(ex))
-        return f"Duffel Flights: unavailable ({describe_error(ex)})"
+        logger.warning("Tripadvisor Flights search failed: %s", describe_error(ex))
+        return f"Tripadvisor Flights: unavailable ({describe_error(ex)})"
 
 
 async def _fetch_visa_requirements(
@@ -363,11 +358,11 @@ async def gather_grounding_packet(
         codes = await codes_task
 
         flight_coro = (
-            _fetch_duffel_flight_results(
+            _fetch_tripadvisor_flight_results(
                 client, codes.origin_airport_codes, codes.destination_airport_codes, check_in, check_out, traveler_count
             )
             if wants_flights
-            else _skip("Duffel Flights: skipped (no origin city provided, so a route can't be formed).")
+            else _skip("Tripadvisor Flights: skipped (no origin city provided, so a route can't be formed).")
         )
         cruise_coro = (
             _fetch_cruise_search_results(client, codes.cruise_destination_id, destination.name)
@@ -377,7 +372,9 @@ async def gather_grounding_packet(
 
         search_snippets = list(
             await asyncio.gather(
-                _fetch_duffel_stays_results(client, destination, check_in, check_out, traveler_count),
+                _fetch_tripadvisor_hotels_results(
+                    client, codes.hotel_location_id, destination.name, check_in, check_out, traveler_count
+                ),
                 _fetch_visa_requirements(client, citizenship, destination.country_code),
                 flight_coro,
                 cruise_coro,

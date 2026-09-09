@@ -15,6 +15,7 @@ from .schemas import (
     DestinationCandidate,
     WeatherOutlook,
 )
+from .units import format_temp_c
 
 logger = logging.getLogger(__name__)
 
@@ -68,16 +69,30 @@ async def check_state_department_advisory(
     """
     today = today or date.today()
 
-    try:
-        response = await get_with_retry(client, _STATE_DEPT_ADVISORIES_URL)
-        entries = response.json()
-        if not isinstance(entries, list):
-            raise ValueError("unexpected response shape from State Department advisories feed")
-        if len(entries) < _MIN_PLAUSIBLE_ADVISORY_COUNT:
-            raise ValueError(f"advisories feed returned only {len(entries)} entries, likely a partial fetch")
-    except Exception as ex:
-        logger.warning("State Department advisory fetch failed: %s", describe_error(ex))
-        return AdvisoryCheck(error=f"unavailable ({describe_error(ex)})")
+    # get_with_retry only retries transport errors and retryable HTTP status codes -- it has
+    # no way to know that a 200 response carrying an implausibly short/empty JSON array is
+    # itself a failure (a partial/truncated fetch, observed live). Retry that case here too,
+    # rather than giving up on the first empty response.
+    entries: list | None = None
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = await get_with_retry(client, _STATE_DEPT_ADVISORIES_URL)
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("unexpected response shape from State Department advisories feed")
+            if len(payload) < _MIN_PLAUSIBLE_ADVISORY_COUNT:
+                raise ValueError(f"advisories feed returned only {len(payload)} entries, likely a partial fetch")
+            entries = payload
+            break
+        except Exception as ex:
+            last_error = ex
+            if attempt < 3:
+                await asyncio.sleep(2 ** (attempt - 1))
+
+    if entries is None:
+        logger.warning("State Department advisory fetch failed: %s", describe_error(last_error))
+        return AdvisoryCheck(error=f"unavailable ({describe_error(last_error)})")
 
     country_code = (destination.country_code or "").strip().upper()
     country_name = destination.country.strip().lower()
@@ -199,7 +214,8 @@ async def _fetch_near_term_forecast(
     )
     return (
         f"Departure is within 14 days, so here is the actual current forecast (not a historical average): "
-        f"average highs around {avg_high}°C, lows around {avg_low}°C; forecast {coverage_note}."
+        f"average highs around {format_temp_c(avg_high)}, lows around {format_temp_c(avg_low)}; "
+        f"forecast {coverage_note}."
     )
 
 

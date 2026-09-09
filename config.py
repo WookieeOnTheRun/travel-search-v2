@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from dotenv import load_dotenv
 
@@ -38,8 +38,21 @@ ENV_FILE_IN_USE = _load_environment()
 
 @dataclass(slots=True)
 class Settings:
-    ollama_model: str = os.getenv("OLLAMA_MODEL", "gemma4:31b")
-    ollama_host: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    # Ollama's cloud-hosted API (verified against https://docs.ollama.com/api/authentication
+    # on 2026-09-08). `ollama_host` is the *root* host handed to the ollama-python SDK's
+    # AsyncClient(host=...) -- that client's chat()/generate() calls already prepend
+    # "/api/<endpoint>" themselves (confirmed by reading ollama/_client.py and by building a
+    # real httpx.Request against both forms), so this must be "https://ollama.com" and NOT
+    # "https://ollama.com/api" -- the latter produces a broken double "/api/api/..." path.
+    # The documented raw-HTTP base URL ("https://ollama.com/api/...", as in the official curl
+    # example) only applies to direct HTTP calls, not to this SDK's host parameter.
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "gemma4:cloud")
+    ollama_host: str = os.getenv("OLLAMA_HOST", "https://ollama.com")
+    # Ollama Cloud authenticates every request with `Authorization: Bearer <OLLAMA_API_KEY>`
+    # (see https://docs.ollama.com/api/authentication). Create a key at
+    # https://ollama.com/settings/keys. Server-side only: never log it, never render it in
+    # the Streamlit UI, and never paste a real value into chat, a PR, or an issue.
+    ollama_api_key: str = os.getenv("OLLAMA_API_KEY", "")
 
     travel_api_endpoints: List[str] = field(
         default_factory=lambda: [
@@ -56,17 +69,6 @@ class Settings:
     default_locale: str = os.getenv("DEFAULT_LOCALE", "en-US")
     default_citizenship_country_code: str = os.getenv("DEFAULT_CITIZENSHIP_COUNTRY_CODE", "US")
 
-    # Flights (offer_requests/offers, places/suggestions for airport resolution) and Stays
-    # (accommodation search) both run against Duffel's REST API -- verified against the
-    # official docs at https://duffel.com/docs/api on 2026-09-04. The same base URL and
-    # Duffel-Version header are used for both test (`duffel_test_...`) and live tokens; only
-    # the token itself selects the environment. See travel_agent/http_utils.py's
-    # duffel_headers() and travel_agent/location_resolution.py / data_sources.py for the
-    # exact endpoints.
-    duffel_api_key: str = os.getenv("DUFFEL_API_KEY", "")
-    duffel_api_base_url: str = os.getenv("DUFFEL_API_BASE_URL", "https://api.duffel.com")
-    duffel_api_version: str = os.getenv("DUFFEL_API_VERSION", "v2")
-
     # Each of these hosts + the fixed endpoint paths in travel_agent/location_resolution.py
     # and travel_agent/data_sources.py were verified against the live RapidAPI products on
     # 2026-09-03 (see session notes). Only the host is configurable: a RapidAPI "host" maps
@@ -74,22 +76,17 @@ class Settings:
     # (as an older version of this file did) just reintroduces the base-URL-with-no-path bug --
     # a mismatched host is the only thing swapping the underlying product actually requires.
     #
-    # Flights and hotel/accommodation search moved to the Duffel API above -- these two RapidAPI
-    # hosts remain only for cruise search (Tripadvisor) and visa requirements, neither of which
-    # Duffel covers.
+    # Flights, hotel/accommodation search, and cruise search all run against the Tripadvisor
+    # RapidAPI product (`tripadvisor16.p.rapidapi.com`) -- verified live on 2026-09-08. Hotel
+    # location/search (searchLocation, searchHotels) work end-to-end on this subscription. The
+    # flight endpoints (searchAirport, searchFlights) are verified to exist with the parameter
+    # contract used in travel_agent/location_resolution.py and travel_agent/data_sources.py, but
+    # searchAirport currently returns an empty result for every query and searchFlights currently
+    # returns a generic server-side error for every valid request tried -- the same kind of
+    # currently-unreliable-but-real-endpoint situation this app already treats as normal for
+    # Tripadvisor cruise search below, not a sign the contract is wrong.
     rapidapi_tripadvisor_host: str = os.getenv("RAPIDAPI_TRIPADVISOR_HOST", "tripadvisor16.p.rapidapi.com")
     rapidapi_visa_host: str = os.getenv("RAPIDAPI_VISA_HOST", "visa-requirement.p.rapidapi.com")
-
-    @property
-    def ollama_env(self) -> Dict[str, str]:
-        # Field names match agent_framework_ollama.OllamaChatClient's env-based settings
-        # loader, which reads env_prefix "OLLAMA_" + the field name uppercased (i.e.
-        # OLLAMA_HOST / OLLAMA_MODEL) -- verified against the installed
-        # agent-framework-ollama package on 2026-09-03.
-        return {
-            "OLLAMA_HOST": self.ollama_host,
-            "OLLAMA_MODEL": self.ollama_model,
-        }
 
 
 settings = Settings()

@@ -13,12 +13,14 @@ from config import ENV_FILE_IN_USE, settings
 from travel_agent import (
     DEFAULT_TRIP_LENGTH_DAYS,
     DestinationCandidate,
+    NearbyAirport,
     UserTripRequest,
     build_itineraries,
     check_state_department_advisory,
     discover_destinations,
     fetch_seasonal_activities,
     fetch_weather_outlook,
+    find_nearest_airports,
     parse_travel_start_date,
     resolve_destination_candidates,
 )
@@ -29,8 +31,11 @@ from travel_agent.schemas import (
     DestinationDiscoveryResult,
     WeatherOutlook,
 )
+from travel_agent.units import format_temp_c
 
 logger = logging.getLogger(__name__)
+
+_NEAREST_AIRPORTS_COUNT = 5
 
 
 # Helper to parse a single markdown table row into a list of cells
@@ -125,23 +130,69 @@ async def _run_discovery(request_text: str, origin_city: str, start_date: date, 
         return await discover_destinations(client, request_text, origin_city, start_date, end_date)
 
 
-# Runs the three destination-selection background checks (State Department advisory,
-# weather outlook, seasonal activities) concurrently as soon as a destination + travel
-# window are confirmed -- ahead of, and independent from, full itinerary generation.
+# Runs a batch of named coroutines concurrently and calls on_progress(label) as each one
+# completes (completion order, not the order given) -- this is what drives the live
+# per-check status bar instead of one opaque spinner for the whole concurrent batch. Each
+# task's own exception (if it somehow raises past its internal error handling) is isolated
+# to that task rather than failing the whole batch, so one broken check doesn't blank out
+# checks that already succeeded.
+async def _gather_tracked(jobs: dict[str, Any], on_progress) -> dict[str, Any]:
+    async def _tag(label: str, coro) -> tuple[str, Any]:
+        try:
+            return label, await coro
+        except Exception as ex:
+            logger.exception("Destination check %r failed", label)
+            return label, ex
+
+    results: dict[str, Any] = {}
+    for finished in asyncio.as_completed([_tag(label, coro) for label, coro in jobs.items()]):
+        label, result = await finished
+        results[label] = result
+        if on_progress:
+            on_progress(label)
+    return results
+
+
+# Runs the destination-selection background checks (State Department advisory, weather
+# outlook, nearest airports, and -- only when requested -- seasonal activities/sightseeing)
+# concurrently as soon as a destination + travel window are confirmed -- ahead of, and
+# independent from, full itinerary generation. Nearest-airport resolution runs unconditionally
+# here specifically because it needs to happen as early as possible after a destination is
+# selected, per the "closest airports" requirement -- not deferred until flight search.
 #
 # Uses the same short-connect-timeout as _DISCOVERY_TIMEOUT rather than a flat
 # settings.request_timeout_seconds: fetch_seasonal_activities calls the same public
 # Overpass API discovery does, and a flat timeout has the identical multi-minute-hang
 # failure mode (verified live) when that service is slow/unreachable.
 async def _gather_destination_insights(
-    destination: DestinationCandidate, start_date: date, end_date: date
-) -> tuple[AdvisoryCheck, WeatherOutlook, ActivitySearchResult]:
+    destination: DestinationCandidate,
+    start_date: date,
+    end_date: date,
+    *,
+    include_activities: bool,
+    on_progress=None,
+) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT) as client:
-        return await asyncio.gather(
-            check_state_department_advisory(client, destination),
-            fetch_weather_outlook(client, destination, start_date, end_date),
-            fetch_seasonal_activities(client, destination, start_date, end_date),
-        )
+        jobs: dict[str, Any] = {
+            "advisory": check_state_department_advisory(client, destination),
+            "weather": fetch_weather_outlook(client, destination, start_date, end_date),
+            "airports": find_nearest_airports(client, destination.latitude, destination.longitude, max_results=_NEAREST_AIRPORTS_COUNT),
+        }
+        if include_activities:
+            jobs["activities"] = fetch_seasonal_activities(client, destination, start_date, end_date)
+
+        results = await _gather_tracked(jobs, on_progress)
+
+    return {
+        "advisory": results["advisory"] if not isinstance(results["advisory"], Exception) else AdvisoryCheck(error=str(results["advisory"])),
+        "weather": results["weather"] if not isinstance(results["weather"], Exception) else WeatherOutlook(error=str(results["weather"])),
+        "airports": results["airports"] if not isinstance(results["airports"], Exception) else [],
+        "activities": (
+            (results["activities"] if not isinstance(results["activities"], Exception) else ActivitySearchResult(error=str(results["activities"])))
+            if include_activities
+            else ActivitySearchResult()
+        ),
+    }
 
 
 def _reset() -> None:
@@ -154,6 +205,7 @@ def _reset() -> None:
         "insight_advisory",
         "insight_weather",
         "insight_activities",
+        "insight_airports",
         "discovery_result",
         "discovery_start_date",
         "discovery_end_date",
@@ -224,11 +276,18 @@ def _render_discovery_result(result: DestinationDiscoveryResult) -> None:
         st.rerun()
 
 
-# Renders the three destination-selection background checks (safety advisory, weather
-# outlook, seasonal activities) directly on the confirm screen, as soon as a destination
-# and travel window are chosen -- independent of the "Generate itinerary options" button.
+# Renders the destination-selection background checks (safety advisory, weather outlook,
+# nearest airports, and -- only when the "show sightseeing" checkbox is on -- seasonal
+# activities) directly on the confirm screen, as soon as a destination and travel window are
+# chosen -- independent of the "Generate itinerary options" button.
 def _render_destination_insights(
-    destination: DestinationCandidate, advisory: AdvisoryCheck, weather: WeatherOutlook, activities: ActivitySearchResult
+    destination: DestinationCandidate,
+    advisory: AdvisoryCheck,
+    weather: WeatherOutlook,
+    airports: list[NearbyAirport],
+    activities: ActivitySearchResult,
+    *,
+    show_activities: bool,
 ) -> None:
     st.subheader("Automatic destination checks")
 
@@ -259,12 +318,38 @@ def _render_destination_insights(
         years_label = ", ".join(str(y) for y in weather.historical_years_used) or "recent years"
         st.info(
             f"Historical average for your travel window (based on {years_label}): "
-            f"highs around {weather.historical_avg_high_c}°C, lows around {weather.historical_avg_low_c}°C."
+            f"highs around {format_temp_c(weather.historical_avg_high_c)}, "
+            f"lows around {format_temp_c(weather.historical_avg_low_c)}."
         )
         if weather.is_near_term and weather.near_term_forecast_summary:
             st.info(weather.near_term_forecast_summary)
 
-    if activities.error:
+    if airports:
+        st.write("Closest airports:")
+        st.dataframe(
+            [
+                {
+                    "Code": a.iata_code,
+                    "Airport": a.name,
+                    "City": a.municipality or "—",
+                    "Country": a.country_code,
+                    "Distance": f"{a.distance_km:,.0f} km",
+                }
+                for a in airports
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Source: OurAirports public dataset (ourairports.com), matched by great-circle "
+            "distance from the destination -- these are the real IATA codes flight search uses."
+        )
+    else:
+        st.caption("Nearest-airport lookup unavailable right now.")
+
+    if not show_activities:
+        st.caption("Sightseeing & points of interest are hidden -- enable the checkbox on the search page to show them.")
+    elif activities.error:
         st.caption(f"Activity/sightseeing search unavailable ({activities.error}).")
     elif activities.activities:
         st.write("Nearby activities & sightseeing (auto-checked against your travel dates):")
@@ -326,6 +411,15 @@ if st.session_state.stage == "intake":
         with col3:
             traveler_count = st.number_input("Number of travelers", min_value=1, max_value=20, value=1)
 
+        show_activities = st.checkbox(
+            "Show sightseeing opportunities & places of interest",
+            value=False,
+            help=(
+                "When checked, the confirm screen will search OpenStreetMap for nearby "
+                "attractions/points of interest and display them. Off by default."
+            ),
+        )
+
         submitted = st.form_submit_button("Find destinations")
 
     if submitted:
@@ -335,13 +429,18 @@ if st.session_state.stage == "intake":
             candidates: list[DestinationCandidate] = []
             parsed_date: date | None = None
             resolution_failed = False
-            with st.spinner("Identifying destination options..."):
+            with st.status("Identifying destination options...", expanded=True) as status:
                 try:
                     candidates, parsed_date = asyncio.run(_resolve_intake(request_text.strip()))
+                    status.update(
+                        label=f"Found {len(candidates)} destination option(s)" if candidates else "No destination found in request text",
+                        state="complete",
+                    )
                 except Exception:
                     logger.exception(
                         "Destination resolution failed (request length=%d chars)", len(request_text)
                     )
+                    status.update(label="Destination lookup failed", state="error")
                     resolution_failed = True
 
             if resolution_failed:
@@ -368,19 +467,22 @@ if st.session_state.stage == "intake":
 
                 discovery_result = None
                 discovery_failed = False
-                with st.spinner(
+                with st.status(
                     "No specific destination was named -- searching for destinations that match what "
                     "you described (this checks real distance, weather, and points-of-interest data, "
-                    "so it can take a little while)..."
-                ):
+                    "so it can take a little while)...",
+                    expanded=True,
+                ) as status:
                     try:
                         discovery_result = asyncio.run(
                             _run_discovery(request_text.strip(), origin_city.strip(), discovery_start, discovery_end)
                         )
+                        status.update(label="Destination search complete", state="complete")
                     except Exception:
                         logger.exception(
                             "Destination discovery failed (request length=%d chars)", len(request_text)
                         )
+                        status.update(label="Destination search failed", state="error")
                         discovery_failed = True
 
                 if discovery_failed or discovery_result is None:
@@ -398,6 +500,7 @@ if st.session_state.stage == "intake":
                         "origin_city": origin_city.strip() or None,
                         "trip_length_days": trip_length_days,
                         "traveler_count": traveler_count,
+                        "show_activities": show_activities,
                     }
                     st.rerun()
             else:
@@ -409,6 +512,7 @@ if st.session_state.stage == "intake":
                     "origin_city": origin_city.strip() or None,
                     "trip_length_days": trip_length_days if trip_length_days > 0 else None,
                     "traveler_count": traveler_count,
+                    "show_activities": show_activities,
                 }
                 st.rerun()
 
@@ -449,31 +553,54 @@ elif st.session_state.stage == "confirm":
 
     trip_length_days = st.session_state.pending.get("trip_length_days") or DEFAULT_TRIP_LENGTH_DAYS
     insight_end_date = travel_start_date + timedelta(days=trip_length_days)
-    insight_key = (selected_destination.label, travel_start_date.isoformat(), insight_end_date.isoformat())
+    show_activities = bool(st.session_state.pending.get("show_activities", False))
+    insight_key = (selected_destination.label, travel_start_date.isoformat(), insight_end_date.isoformat(), show_activities)
+
+    _INSIGHT_STEP_LABELS = {
+        "advisory": "U.S. State Department travel advisory",
+        "weather": "Weather outlook",
+        "airports": "Closest airports",
+        "activities": "Sightseeing & points of interest",
+    }
 
     if st.session_state.get("insight_key") != insight_key:
-        with st.spinner("Checking travel advisories, weather outlook, and nearby activities..."):
+        with st.status("Running destination checks...", expanded=True) as status:
+            def _on_insight_progress(step_key: str) -> None:
+                status.write(f"✅ {_INSIGHT_STEP_LABELS.get(step_key, step_key)}")
+
             try:
-                advisory, weather, activities = asyncio.run(
-                    _gather_destination_insights(selected_destination, travel_start_date, insight_end_date)
+                insights = asyncio.run(
+                    _gather_destination_insights(
+                        selected_destination,
+                        travel_start_date,
+                        insight_end_date,
+                        include_activities=show_activities,
+                        on_progress=_on_insight_progress,
+                    )
                 )
+                status.update(label="Destination checks complete", state="complete")
             except Exception:
                 logger.exception("Destination insight checks failed for a selected destination")
-                advisory, weather, activities = (
-                    AdvisoryCheck(error="an unexpected error occurred while checking"),
-                    WeatherOutlook(error="an unexpected error occurred while checking"),
-                    ActivitySearchResult(error="an unexpected error occurred while checking"),
-                )
+                status.update(label="Destination checks failed", state="error")
+                insights = {
+                    "advisory": AdvisoryCheck(error="an unexpected error occurred while checking"),
+                    "weather": WeatherOutlook(error="an unexpected error occurred while checking"),
+                    "airports": [],
+                    "activities": ActivitySearchResult(error="an unexpected error occurred while checking"),
+                }
         st.session_state.insight_key = insight_key
-        st.session_state.insight_advisory = advisory
-        st.session_state.insight_weather = weather
-        st.session_state.insight_activities = activities
+        st.session_state.insight_advisory = insights["advisory"]
+        st.session_state.insight_weather = insights["weather"]
+        st.session_state.insight_airports = insights["airports"]
+        st.session_state.insight_activities = insights["activities"]
 
     _render_destination_insights(
         selected_destination,
         st.session_state.insight_advisory,
         st.session_state.insight_weather,
+        st.session_state.insight_airports,
         st.session_state.insight_activities,
+        show_activities=show_activities,
     )
 
     back_col, generate_col = st.columns([1, 3])
@@ -494,9 +621,13 @@ elif st.session_state.stage == "confirm":
             travel_start_date=travel_start_date,
         )
         result = None
-        with st.spinner("Planning your trip with the agentic workflow..."):
+        with st.status("Planning your trip with the agentic workflow...", expanded=True) as status:
+            def _on_build_progress(message: str) -> None:
+                status.write(message)
+
             try:
-                result = asyncio.run(build_itineraries(request, selected_destination))
+                result = asyncio.run(build_itineraries(request, selected_destination, on_progress=_on_build_progress))
+                status.update(label="Itinerary generation complete", state="complete")
             except Exception:
                 # Don't log the raw request text: it's free-form user input that
                 # commonly includes names, travel dates, and budget — logging it
@@ -505,6 +636,7 @@ elif st.session_state.stage == "confirm":
                 logger.exception(
                     "build_itineraries failed (request length=%d chars)", len(pending["request_text"])
                 )
+                status.update(label="Itinerary generation failed", state="error")
                 st.error(
                     "We couldn't generate itinerary options this time (an upstream service may be "
                     "unavailable or rate-limited). Please try again in a moment."

@@ -12,9 +12,8 @@ logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-# Serializes requests per host (this applies to RapidAPI hosts and api.duffel.com alike,
-# since _host_lock_for keys purely on hostname). Verified live (2026-09-03) against the
-# RapidAPI hosts still used here (Tripadvisor, visa requirements): firing two concurrent
+# Serializes requests per host, since _host_lock_for keys purely on hostname. Verified live
+# (2026-09-03) against the RapidAPI hosts used here (Tripadvisor, visa requirements): firing two concurrent
 # requests at the same host reliably triggers 429s that exhaust the retry budget and come
 # back as empty/incomplete data rather than raising -- silently degrading result quality
 # instead of failing loudly. A different host is unaffected, so this only serializes calls
@@ -160,16 +159,4 @@ def rapidapi_headers(host: str) -> dict[str, str]:
     return {
         "x-rapidapi-key": settings.rapidapi_key,
         "x-rapidapi-host": host,
-    }
-
-
-# Header set required by every Duffel API request -- verified against
-# https://duffel.com/docs/api/overview/making-requests on 2026-09-04.
-def duffel_headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {settings.duffel_api_key}",
-        "Duffel-Version": settings.duffel_api_version,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Accept-Encoding": "gzip",
     }

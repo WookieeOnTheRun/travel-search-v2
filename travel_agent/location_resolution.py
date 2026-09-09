@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import re
 from datetime import date, datetime
@@ -9,8 +11,9 @@ import httpx
 from dateutil import parser as dateutil_parser
 
 from config import settings
-from .http_utils import describe_error, duffel_headers, get_with_retry, rapidapi_headers
-from .schemas import DestinationCandidate
+from .geo import haversine_km
+from .http_utils import describe_error, get_with_retry, rapidapi_headers
+from .schemas import DestinationCandidate, NearbyAirport
 
 logger = logging.getLogger(__name__)
 
@@ -169,79 +172,108 @@ def parse_travel_start_date(request_text: str, *, today: date | None = None) -> 
 
 
 # ---------------------------------------------------------------------------
-# Airport code resolution (Duffel Places suggestions API)
+# Airport code resolution (OurAirports public dataset, by great-circle distance)
+#
+# Tripadvisor's RapidAPI flight airport-search endpoint (GET /api/v1/flights/searchAirport
+# on tripadvisor16.p.rapidapi.com) was used here previously, but is confirmed (live,
+# 2026-09-08) to return an empty `data` array for every query tried -- city names, IATA
+# codes, and single letters alike -- on this app's subscription. Rather than build a
+# "nearest airports" feature on top of a source that has never once returned a result, this
+# resolves airports directly from OurAirports.com's public-domain airport dataset (a
+# well-known, widely-used open aviation dataset -- see https://ourairports.com/data/ and
+# https://github.com/davidmegginson/ourairports-data; confirmed live and cross-checked
+# against OurAirports' own data-dictionary docs on 2026-09-09) by great-circle distance from
+# the destination/origin coordinates already resolved via geocoding. No API key required,
+# and every code returned is a real row from that dataset -- never an LLM-guessed code.
 # ---------------------------------------------------------------------------
 
+_OURAIRPORTS_CSV_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+# large_airport/medium_airport with a populated iata_code covers essentially every airport
+# with real scheduled commercial service (small_airport rows are overwhelmingly private
+# strips/heliports without commercial flights) -- verified by inspecting a live pull of the
+# dataset on 2026-09-09 (~4,500 of ~86,000 rows match this filter).
+_RELEVANT_AIRPORT_TYPES = {"large_airport", "medium_airport"}
 
-async def resolve_airport_codes(
-    client: httpx.AsyncClient,
-    query: str,
-    *,
-    country_hint: str | None = None,
-    max_codes: int = 3,
-) -> list[str]:
-    """Resolves a place name to real IATA airport codes via Duffel's Places suggestions
-    endpoint (GET /places/suggestions?query=... -- verified against
-    https://duffel.com/docs/api/places/get-place-suggestions on 2026-09-04) -- never via
-    an LLM guessing codes from its own memory. Only entries where the Place `type` is
-    "airport" are collected, since that's the code shape Duffel's own flight-search
-    examples (offer_requests slices) use for origin/destination.
+# Cached for the lifetime of the process: the filtered dataset is ~4,500 rows (cheap to hold
+# in memory) but the raw CSV is ~13MB (too expensive to refetch on every airport lookup). Not
+# lock-protected -- see the loop-binding note on `_host_locks` in http_utils.py for why an
+# asyncio.Lock reused across Streamlit's per-rerun event loops would be actively dangerous
+# here; the worst case of two concurrent callers both missing a cold cache is one redundant
+# fetch, not corrupted data.
+_airports_cache: list[dict[str, str]] | None = None
 
-    `country_hint`, when given, is expected to be an ISO 3166-1 alpha-2 country code
-    (DestinationCandidate.country_code) to match against the Place's `iata_country_code`.
+
+async def _load_airports_dataset(client: httpx.AsyncClient) -> list[dict[str, str]]:
+    global _airports_cache
+    if _airports_cache is not None:
+        return _airports_cache
+
+    response = await get_with_retry(client, _OURAIRPORTS_CSV_URL)
+    reader = csv.DictReader(io.StringIO(response.text))
+    airports = [row for row in reader if row.get("iata_code") and row.get("type") in _RELEVANT_AIRPORT_TYPES]
+    _airports_cache = airports
+    return airports
+
+
+async def find_nearest_airports(
+    client: httpx.AsyncClient, latitude: float, longitude: float, *, max_results: int = 5
+) -> list[NearbyAirport]:
+    """Finds the closest real airports (by great-circle distance) to a coordinate. Returns
+    real IATA codes and distances from the OurAirports dataset; never a guess. Callers must
+    treat an empty result as "unavailable" (e.g. the dataset fetch failed), not "no airports
+    near here" -- every inhabited region on Earth is within range of at least a few rows in
+    this dataset.
     """
-    if not settings.duffel_api_key or not query.strip():
-        return []
-
-    url = f"{settings.duffel_api_base_url}/places/suggestions"
-
     try:
-        response = await get_with_retry(client, url, params={"query": query}, headers=duffel_headers())
-        results = response.json().get("data") or []
+        airports = await _load_airports_dataset(client)
     except Exception as ex:
-        logger.warning("Duffel place search for %r failed: %s", query, describe_error(ex))
+        logger.warning("Airport dataset fetch failed: %s", describe_error(ex))
         return []
 
-    airports = [entry for entry in results if entry.get("type") == "airport" and entry.get("iata_code")]
-    if not airports:
-        return []
+    scored: list[tuple[float, dict[str, str]]] = []
+    for row in airports:
+        try:
+            lat = float(row["latitude_deg"])
+            lon = float(row["longitude_deg"])
+        except (KeyError, ValueError):
+            continue
+        scored.append((haversine_km(latitude, longitude, lat, lon), row))
 
-    def _matches_country(entry: dict) -> bool:
-        if not country_hint:
-            return True
-        return str(entry.get("iata_country_code") or "").upper() == country_hint.upper()
+    scored.sort(key=lambda item: item[0])
 
-    matched = [entry for entry in airports if _matches_country(entry)]
-    if not matched:
-        logger.warning(
-            "No Duffel airport result for %r matched country hint %r; falling back to top result %r",
-            query,
-            country_hint,
-            airports[0].get("name"),
+    return [
+        NearbyAirport(
+            iata_code=row["iata_code"],
+            name=row.get("name") or row["iata_code"],
+            municipality=row.get("municipality") or None,
+            country_code=row.get("iso_country") or "",
+            distance_km=round(distance, 1),
         )
-        matched = airports[:1]
+        for distance, row in scored[:max_results]
+    ]
 
-    codes: list[str] = []
-    for entry in matched:
-        code = entry["iata_code"]
-        if code not in codes:
-            codes.append(code)
-        if len(codes) >= max_codes:
-            break
 
-    return codes[:max_codes]
+async def resolve_destination_airport_codes(
+    client: httpx.AsyncClient, destination: DestinationCandidate, *, max_codes: int = 3
+) -> list[str]:
+    """Just the IATA codes (for search API params) of the nearest airports to a confirmed
+    destination -- see find_nearest_airports for the full, richer result used for display.
+    """
+    airports = await find_nearest_airports(client, destination.latitude, destination.longitude, max_results=max_codes)
+    return [a.iata_code for a in airports]
 
 
 async def resolve_origin_airport_codes(client: httpx.AsyncClient, origin_city_text: str, *, max_codes: int = 3) -> list[str]:
     """Same airport resolution, but for a free-typed origin city with no prior
-    disambiguation step. Geocodes it first (one cheap public API call) so the
-    same country-aware matching used for the destination applies to the origin.
+    disambiguation step. Geocodes it first (one cheap public API call) to get coordinates.
     """
     if not origin_city_text.strip():
         return []
     origin_candidates = await geocode_candidates(client, origin_city_text, count=1)
-    country_hint = origin_candidates[0].country_code if origin_candidates else None
-    return await resolve_airport_codes(client, origin_city_text, country_hint=country_hint, max_codes=max_codes)
+    if not origin_candidates:
+        return []
+    origin = origin_candidates[0]
+    return await resolve_destination_airport_codes(client, origin, max_codes=max_codes)
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +312,45 @@ async def resolve_cruise_destination_id(
         results[0],
     )
     return chosen.get("documentId") or chosen.get("id")
+
+
+# ---------------------------------------------------------------------------
+# Hotel/accommodation location id (Tripadvisor RapidAPI, GET
+# /api/v1/hotels/searchLocation) -- verified live end-to-end on 2026-09-08: a query like
+# "Paris" returns real `geoId`/`documentId` values, and that `geoId` is confirmed to work
+# directly against /api/v1/hotels/searchHotels (see _fetch_tripadvisor_hotels_results in
+# data_sources.py), unlike the flight/cruise Tripadvisor endpoints above.
+# ---------------------------------------------------------------------------
+
+
+async def resolve_hotel_location_id(
+    client: httpx.AsyncClient, candidate: DestinationCandidate
+) -> str | None:
+    if not settings.rapidapi_key:
+        return None
+
+    host = settings.rapidapi_tripadvisor_host
+    url = f"https://{host}/api/v1/hotels/searchLocation"
+
+    try:
+        response = await get_with_retry(client, url, params={"query": candidate.name}, headers=rapidapi_headers(host))
+        payload = response.json()
+    except Exception as ex:
+        logger.warning("Hotel location search for %r failed: %s", candidate.name, describe_error(ex))
+        return None
+
+    if payload.get("status") is False:
+        logger.warning("Hotel location search for %r returned an error payload: %s", candidate.name, payload.get("message"))
+        return None
+
+    results = payload.get("data") or []
+    if not results:
+        return None
+
+    def _title_matches(entry: dict) -> bool:
+        title = re.sub(r"</?b>", "", str(entry.get("title") or ""))
+        return candidate.name.lower() in title.lower()
+
+    chosen = next((r for r in results if _title_matches(r)), results[0])
+    geo_id = chosen.get("geoId")
+    return str(geo_id) if geo_id is not None else None

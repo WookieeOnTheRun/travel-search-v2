@@ -37,13 +37,25 @@ class DestinationCandidate(BaseModel):
         return f"{self.name}{region}, {self.country}"
 
 
+# One real airport near a destination or origin, resolved by great-circle distance from the
+# OurAirports public dataset (see location_resolution.find_nearest_airports) -- never an
+# LLM-guessed code.
+class NearbyAirport(BaseModel):
+    iata_code: str
+    name: str
+    municipality: str | None = None
+    country_code: str = ""
+    distance_km: float
+
+
 # Provider-specific ids/codes resolved for the user's confirmed destination selection.
-# These are what actually get passed to search APIs -- never LLM-guessed. Duffel Stays
-# searches by geographic coordinates directly (see data_sources.py), so no hotel/accommodation
-# location id needs to be resolved here the way the old Tripadvisor/Booking.com hotel search did.
+# These are what actually get passed to search APIs -- never LLM-guessed. `hotel_location_id`
+# is the Tripadvisor `geoId` from hotels/searchLocation (see location_resolution.py), required
+# by hotels/searchHotels for accommodation search.
 class LocationCodes(BaseModel):
     destination_airport_codes: list[str] = Field(default_factory=list)
     origin_airport_codes: list[str] = Field(default_factory=list)
+    hotel_location_id: str | None = None
     cruise_destination_id: str | None = None
 
 

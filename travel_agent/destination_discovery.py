@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import re
 from datetime import date
 from textwrap import dedent
 
 import httpx
 from agent_framework import Agent
-from agent_framework.ollama import OllamaChatClient
 
 from .destination_insights import fetch_weather_outlook
+from .geo import haversine_km
 from .http_utils import describe_error, get_with_retry, post_with_retry
-from .itinerary_agent import configure_model_env
+from .itinerary_agent import build_ollama_client
 from .location_resolution import geocode_candidates
 from .schemas import (
     DestinationCandidate,
@@ -21,6 +20,7 @@ from .schemas import (
     DiscoveredDestination,
     TripConstraints,
 )
+from .units import format_temp_c
 
 logger = logging.getLogger(__name__)
 
@@ -149,17 +149,6 @@ _RADIUS_TOLERANCE = 1.25
 # and adjustable, not a hidden assumption.
 WARM_THRESHOLD_C = 24.0  # ~75°F
 
-_EARTH_RADIUS_KM = 6371.0
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance between two coordinates, in kilometers."""
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(a))
-
 
 # ---------------------------------------------------------------------------
 # Step 3: brainstorm candidate destination NAMES.
@@ -246,8 +235,7 @@ async def _brainstorm_candidate_names(constraints: TripConstraints, origin_label
     ).strip()
 
     try:
-        configure_model_env()
-        client = OllamaChatClient()
+        client = build_ollama_client()
         agent = Agent(name="DestinationIdeaAgent", client=client, instructions=_DESTINATION_IDEA_AGENT_INSTRUCTIONS)
         response = await agent.run(prompt)
         names = _parse_name_list(str(response))
@@ -410,7 +398,8 @@ async def _apply_weather(
         years_label = ", ".join(str(y) for y in weather.historical_years_used) or "recent years"
         discovered.rationale.append(
             f"Historical average for your dates (based on {years_label}): "
-            f"highs around {weather.historical_avg_high_c}°C, lows around {weather.historical_avg_low_c}°C."
+            f"highs around {format_temp_c(weather.historical_avg_high_c)}, "
+            f"lows around {format_temp_c(weather.historical_avg_low_c)}."
         )
     return discovered
 
