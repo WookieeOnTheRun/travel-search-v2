@@ -76,16 +76,17 @@ class Settings:
     # (as an older version of this file did) just reintroduces the base-URL-with-no-path bug --
     # a mismatched host is the only thing swapping the underlying product actually requires.
     #
-    # Flights, hotel/accommodation search, and cruise search all run against the Tripadvisor
-    # RapidAPI product (`tripadvisor16.p.rapidapi.com`) -- verified live on 2026-09-08. Hotel
-    # location/search (searchLocation, searchHotels) work end-to-end on this subscription. The
-    # flight endpoints (searchAirport, searchFlights) are verified to exist with the parameter
-    # contract used in travel_agent/location_resolution.py and travel_agent/data_sources.py, but
-    # searchAirport currently returns an empty result for every query and searchFlights currently
-    # returns a generic server-side error for every valid request tried -- the same kind of
-    # currently-unreliable-but-real-endpoint situation this app already treats as normal for
-    # Tripadvisor cruise search below, not a sign the contract is wrong.
-    rapidapi_tripadvisor_host: str = os.getenv("RAPIDAPI_TRIPADVISOR_HOST", "tripadvisor16.p.rapidapi.com")
+    # Flight and hotel/accommodation search both run against the Booking.com RapidAPI product
+    # (`booking-com15.p.rapidapi.com`), verified live end-to-end on 2026-09-10: flights via
+    # flights/searchDestination -> flights/searchFlights, hotels via a matching two-step flow,
+    # hotels/searchDestination (returns a `dest_id`/`search_type` pair per candidate place) ->
+    # hotels/searchHotels (takes that exact `dest_id`/`search_type` pair). This product replaced
+    # Tripadvisor for both: Tripadvisor's flight endpoints (searchAirport, searchFlights) never
+    # returned usable results on this subscription (searchAirport: empty `data` for every query;
+    # searchFlights: HTTP 200 with a `{"status": false, ...}` error body for every valid
+    # request), and Tripadvisor is no longer used for hotels either so the app depends on a
+    # single flight+hotel provider instead of two.
+    rapidapi_booking_host: str = os.getenv("RAPIDAPI_BOOKING_HOST", "booking-com15.p.rapidapi.com")
     rapidapi_visa_host: str = os.getenv("RAPIDAPI_VISA_HOST", "visa-requirement.p.rapidapi.com")
 
 

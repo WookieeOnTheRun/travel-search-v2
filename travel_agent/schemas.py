@@ -49,14 +49,18 @@ class NearbyAirport(BaseModel):
 
 
 # Provider-specific ids/codes resolved for the user's confirmed destination selection.
-# These are what actually get passed to search APIs -- never LLM-guessed. `hotel_location_id`
-# is the Tripadvisor `geoId` from hotels/searchLocation (see location_resolution.py), required
-# by hotels/searchHotels for accommodation search.
+# These are what actually get passed to search APIs -- never LLM-guessed. All are Booking.com
+# ids (see location_resolution.py): `destination_flight_location_id`/`origin_flight_location_id`
+# come from flights/searchDestination (e.g. "JFK.AIRPORT") and are required by
+# flights/searchFlights. `hotel_dest_id`/`hotel_search_type` come as a matched pair from
+# hotels/searchDestination and are both required, together, by hotels/searchHotels.
 class LocationCodes(BaseModel):
     destination_airport_codes: list[str] = Field(default_factory=list)
     origin_airport_codes: list[str] = Field(default_factory=list)
-    hotel_location_id: str | None = None
-    cruise_destination_id: str | None = None
+    destination_flight_location_id: str | None = None
+    origin_flight_location_id: str | None = None
+    hotel_dest_id: str | None = None
+    hotel_search_type: str | None = None
 
 
 # A consolidated data packet containing all external grounding information used by the agents to build itineraries

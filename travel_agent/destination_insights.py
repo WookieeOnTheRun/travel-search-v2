@@ -292,13 +292,13 @@ async def _noop() -> None:
 #
 # Sourced from OpenStreetMap's public Overpass API (overpass-api.de/api/interpreter,
 # no key required) -- verified live on 2026-09-03 to return named tourism/historic
-# points of interest with tags including opening_hours. Tripadvisor's RapidAPI
-# product already used elsewhere in this app (tripadvisor16.p.rapidapi.com) was
-# checked for an attractions/things-to-do endpoint first: over a dozen plausible
-# paths (attractions/searchAttractions, attraction/searchLocation, poi/*, tours/*,
-# thingstodo/*, etc.) were probed live against it and every one 404'd, and its
-# sibling restaurant endpoints that DO exist are currently failing server-side --
-# so it is not used here rather than guessing at an unverified path.
+# points of interest with tags including opening_hours. Tripadvisor's RapidAPI product
+# (tripadvisor16.p.rapidapi.com, no longer used anywhere in this app -- flight and hotel
+# search have since both moved to Booking.com) was checked for an attractions/things-to-do
+# endpoint first: over a dozen plausible paths (attractions/searchAttractions,
+# attraction/searchLocation, poi/*, tours/*, thingstodo/*, etc.) were probed live against it
+# and every one 404'd, and its sibling restaurant endpoints that DO exist were failing
+# server-side -- so it was not used here rather than guessing at an unverified path.
 # ---------------------------------------------------------------------------
 
 _OVERPASS_URL = "https://overpass-api.de/api/interpreter"

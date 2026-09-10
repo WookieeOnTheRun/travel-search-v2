@@ -277,80 +277,140 @@ async def resolve_origin_airport_codes(client: httpx.AsyncClient, origin_city_te
 
 
 # ---------------------------------------------------------------------------
-# Cruise destination id (Tripadvisor) -- endpoint verified to exist but is
-# currently failing server-side for every query tested; kept so it self-heals
-# and callers must treat None as "unavailable", not "no cruises found".
+# Flight location id (Booking.com RapidAPI, GET /api/v1/flights/searchDestination) -- this
+# is the id flights/searchFlights' fromId/toId params require (e.g. "JFK.AIRPORT"), not a bare
+# IATA code. Verified live on 2026-09-10: querying by IATA code (e.g. "JFK") reliably returns
+# an AIRPORT entry whose `code` matches the query and whose `id` is the exact value
+# searchFlights needs -- confirmed by feeding that id straight into searchFlights and getting
+# real flight offers back. Querying by the already-resolved IATA code (rather than a free-typed
+# city name) is what keeps this an exact, non-ambiguous match instead of a guess.
 # ---------------------------------------------------------------------------
 
 
-async def resolve_cruise_destination_id(
-    client: httpx.AsyncClient, candidate: DestinationCandidate
-) -> str | None:
-    if not settings.rapidapi_key:
+async def resolve_booking_flight_location_id(client: httpx.AsyncClient, iata_code: str) -> str | None:
+    if not settings.rapidapi_key or not iata_code:
         return None
 
-    host = settings.rapidapi_tripadvisor_host
-    url = f"https://{host}/api/v1/cruises/getLocation"
+    host = settings.rapidapi_booking_host
+    url = f"https://{host}/api/v1/flights/searchDestination"
 
     try:
-        response = await get_with_retry(client, url, params={"query": candidate.name}, headers=rapidapi_headers(host))
+        response = await get_with_retry(client, url, params={"query": iata_code}, headers=rapidapi_headers(host))
         payload = response.json()
     except Exception as ex:
-        logger.warning("Cruise location search for %r failed: %s", candidate.name, describe_error(ex))
+        logger.warning("Booking.com flight location search for %r failed: %s", iata_code, describe_error(ex))
         return None
 
     if payload.get("status") is False:
-        logger.warning("Cruise location search for %r returned an error payload: %s", candidate.name, payload.get("message"))
+        logger.warning(
+            "Booking.com flight location search for %r returned an error payload: %s",
+            iata_code,
+            payload.get("message"),
+        )
         return None
 
     results = payload.get("data") or []
-    if not results:
-        return None
-
-    chosen = next(
-        (r for r in results if candidate.name.lower() in str(r.get("name") or r.get("title") or "").lower()),
-        results[0],
+    match = next(
+        (r for r in results if r.get("type") == "AIRPORT" and str(r.get("code") or "").upper() == iata_code.upper()),
+        None,
     )
-    return chosen.get("documentId") or chosen.get("id")
+    return match.get("id") if match else None
+
+
+async def _resolve_flight_location(client: httpx.AsyncClient, iata_codes: list[str]) -> str | None:
+    """Tries each candidate IATA code in order (nearest airport first) until one resolves to a
+    Booking.com location id, since a small/regional airport occasionally has no matching
+    AIRPORT entry on this product even though a nearby larger one does.
+    """
+    for code in iata_codes:
+        location_id = await resolve_booking_flight_location_id(client, code)
+        if location_id:
+            return location_id
+    return None
+
+
+async def resolve_destination_flight_location(
+    client: httpx.AsyncClient, destination: DestinationCandidate
+) -> tuple[list[str], str | None]:
+    """Combines airport-code resolution (OurAirports, by distance) with Booking.com location-id
+    resolution for a confirmed destination. Returns the raw IATA codes alongside the resolved
+    Booking.com id so callers can still report/log the underlying codes.
+    """
+    codes = await resolve_destination_airport_codes(client, destination)
+    location_id = await _resolve_flight_location(client, codes) if codes else None
+    return codes, location_id
+
+
+async def resolve_origin_flight_location(
+    client: httpx.AsyncClient, origin_city_text: str
+) -> tuple[list[str], str | None]:
+    """Same as resolve_destination_flight_location, but for a free-typed origin city."""
+    codes = await resolve_origin_airport_codes(client, origin_city_text)
+    location_id = await _resolve_flight_location(client, codes) if codes else None
+    return codes, location_id
 
 
 # ---------------------------------------------------------------------------
-# Hotel/accommodation location id (Tripadvisor RapidAPI, GET
-# /api/v1/hotels/searchLocation) -- verified live end-to-end on 2026-09-08: a query like
-# "Paris" returns real `geoId`/`documentId` values, and that `geoId` is confirmed to work
-# directly against /api/v1/hotels/searchHotels (see _fetch_tripadvisor_hotels_results in
-# data_sources.py), unlike the flight/cruise Tripadvisor endpoints above.
+# Hotel/accommodation destination id (Booking.com RapidAPI, GET
+# /api/v1/hotels/searchDestination) -- verified live on 2026-09-10: a query like "Paris" or
+# "man" returns multiple candidate places, each carrying its own `dest_id` + `search_type`
+# pair (e.g. {"dest_id": "-1456928", "search_type": "city", ...}, alongside "district",
+# "landmark", "airport", "region" entries for the same query). That exact `dest_id`/
+# `search_type` pair -- not a bare id -- is what hotels/searchHotels requires (see
+# _fetch_booking_hotel_results in data_sources.py). A "city" entry is preferred and matched
+# against both the resolved place name and country code (e.g. Manchester, NH vs Manchester,
+# UK both come back as "city" entries for query "man"), falling back to any "city" entry and
+# then the first result overall if no confident match is found.
 # ---------------------------------------------------------------------------
 
 
-async def resolve_hotel_location_id(
+async def resolve_booking_hotel_destination(
     client: httpx.AsyncClient, candidate: DestinationCandidate
-) -> str | None:
+) -> tuple[str, str] | tuple[None, None]:
     if not settings.rapidapi_key:
-        return None
+        return None, None
 
-    host = settings.rapidapi_tripadvisor_host
-    url = f"https://{host}/api/v1/hotels/searchLocation"
+    host = settings.rapidapi_booking_host
+    url = f"https://{host}/api/v1/hotels/searchDestination"
 
     try:
         response = await get_with_retry(client, url, params={"query": candidate.name}, headers=rapidapi_headers(host))
         payload = response.json()
     except Exception as ex:
-        logger.warning("Hotel location search for %r failed: %s", candidate.name, describe_error(ex))
-        return None
+        logger.warning("Hotel destination search for %r failed: %s", candidate.name, describe_error(ex))
+        return None, None
 
     if payload.get("status") is False:
-        logger.warning("Hotel location search for %r returned an error payload: %s", candidate.name, payload.get("message"))
-        return None
+        logger.warning(
+            "Hotel destination search for %r returned an error payload: %s", candidate.name, payload.get("message")
+        )
+        return None, None
 
     results = payload.get("data") or []
     if not results:
-        return None
+        return None, None
 
-    def _title_matches(entry: dict) -> bool:
-        title = re.sub(r"</?b>", "", str(entry.get("title") or ""))
-        return candidate.name.lower() in title.lower()
+    def _place_label(entry: dict) -> str:
+        return str(entry.get("label") or entry.get("name") or entry.get("city_name") or "")
 
-    chosen = next((r for r in results if _title_matches(r)), results[0])
-    geo_id = chosen.get("geoId")
-    return str(geo_id) if geo_id is not None else None
+    def _is_city_entry(entry: dict) -> bool:
+        return str(entry.get("search_type") or "").lower() == "city"
+
+    def _is_confident_city_match(entry: dict) -> bool:
+        if not _is_city_entry(entry):
+            return False
+        name_matches = candidate.name.lower() in _place_label(entry).lower()
+        country_matches = not candidate.country_code or str(entry.get("cc1") or "").lower() == candidate.country_code.lower()
+        return name_matches and country_matches
+
+    chosen = (
+        next((r for r in results if _is_confident_city_match(r)), None)
+        or next((r for r in results if _is_city_entry(r)), None)
+        or results[0]
+    )
+
+    dest_id = chosen.get("dest_id")
+    search_type = chosen.get("search_type")
+    if dest_id is None or not search_type:
+        return None, None
+    return str(dest_id), str(search_type)

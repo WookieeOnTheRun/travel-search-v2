@@ -20,35 +20,38 @@ This project builds a travel concierge workflow that:
 - recommends local transportation options,
 - prioritizes luxury experience within budget and traveler safety.
 
-Flight search, hotel/accommodation search, and cruise search all run against the
-**Tripadvisor API via RapidAPI** (`tripadvisor16.p.rapidapi.com` -- endpoint paths and
-parameter contracts verified against the live API on 2026-09-08; see
-`travel_agent/location_resolution.py` and `travel_agent/data_sources.py` for the exact
-endpoints/parameters):
+Flight and hotel/accommodation search both run against the **Booking.com API via RapidAPI**
+(`booking-com15.p.rapidapi.com` -- endpoint paths and parameter contracts verified against the
+live API on 2026-09-10); see `travel_agent/location_resolution.py` and
+`travel_agent/data_sources.py` for the exact endpoints/parameters:
 
 | Source | Used for |
 |---|---|
-| Tripadvisor Hotels (`GET /api/v1/hotels/searchLocation` + `GET /api/v1/hotels/searchHotels`) | Hotel/accommodation search, by a resolved Tripadvisor `geoId` for the destination -- verified working end-to-end |
-| Tripadvisor Flights (`GET /api/v1/flights/searchAirport` + `GET /api/v1/flights/searchFlights`) | Airport code resolution and flight search, by resolved IATA airport codes -- endpoint paths and parameter names are verified, but see the reliability note below |
-| Tripadvisor Cruises (`GET /api/v1/cruises/getLocation` + `GET /api/v1/cruises/searchCruises`) | Cruise search (currently failing server-side on this product -- see note below) |
+| Booking.com Flights (`GET /api/v1/flights/searchDestination` + `GET /api/v1/flights/searchFlights`) | Airport-code-to-location-id resolution and flight search, by resolved IATA airport codes -- verified working end-to-end, including round-trip, with real priced offers |
+| Booking.com Hotels (`GET /api/v1/hotels/searchDestination` + `GET /api/v1/hotels/searchHotels`) | Hotel/accommodation search: `searchDestination` resolves the destination name to a matched `dest_id`/`search_type` pair, which `searchHotels` requires together -- verified working end-to-end |
 
-A separate RapidAPI host handles the one thing Tripadvisor doesn't cover:
+A separate RapidAPI host handles the one thing neither of the above covers:
 
 | Source | Used for |
 |---|---|
 | Visa Requirements (`visa-requirement.p.rapidapi.com`) | Visa/entry requirement lookup |
 
-**Tripadvisor's flight endpoints and cruise search (`cruises/getLocation`) are currently
-unreliable.** All three paths are registered (not 404s) and their request parameters are
-verified against the live API's own validation layer, but `flights/searchAirport` returns an
-empty result for every query tried, `flights/searchFlights` returns a generic server-side
-error for every syntactically valid request tried, and `cruises/getLocation` returns a
-generic error for every query tested, including real port cities. All three are still wired
-up per their real, verified contracts -- flight search is gated so it's only called when an
-origin city is given, cruise search only when the request mentions cruising -- and each
-degrades to a clear "unavailable" message rather than fabricating results; they'll start
-working automatically if the upstream issue clears. Hotel/accommodation search has no such
-issue: it's verified working end-to-end with real results.
+**Both flight and hotel search moved off Tripadvisor to Booking.com because Tripadvisor's
+endpoints never returned usable results on this subscription** -- `flights/searchAirport`
+returned an empty result for every query tried, `flights/searchFlights` returned a generic
+server-side error (HTTP 200 with `{"status": false, ...}`) for every syntactically valid
+request tried, and its cruise endpoints (`cruises/getLocation`/`cruises/searchCruises`) never
+returned usable results either. Booking.com's flight and hotel endpoints were verified live on
+2026-09-10 to return real data end-to-end: for flights, querying `searchDestination` by an
+already-resolved IATA code (from the OurAirports dataset -- see the airport-resolution note
+below) reliably returns the exact Booking.com location id (`fromId`/`toId`, e.g.
+`"JFK.AIRPORT"`) that `searchFlights` requires; for hotels, querying `searchDestination` by the
+confirmed destination name returns a `dest_id`/`search_type` pair (matched against a "city"
+entry, disambiguated by country code) that `searchHotels` requires together, and both
+`searchFlights` and `searchHotels` return real, priced results end-to-end. There is no cruise
+search feature in this app -- it depended entirely on Tripadvisor's unreliable cruise
+endpoints and was removed along with the rest of the Tripadvisor integration rather than kept
+around with no working data source.
 
 ## Destination-selection checks (`travel_agent/destination_insights.py`)
 
@@ -67,14 +70,14 @@ The same State Department check also now grounds the final itinerary's safety se
 so the confirm-screen banner and the generated itinerary never cite conflicting sources.
 
 **Tripadvisor was evaluated for the activities check first and ruled out, not guessed
-around.** Since `tripadvisor16.p.rapidapi.com` is already used elsewhere in this app, it was
-checked live for an attractions/things-to-do endpoint before reaching for OpenStreetMap: over
-a dozen plausible paths (`attractions/searchAttractions`, `attraction/searchLocation`,
-`poi/searchLocation`, `tours/searchLocation`, `thingstodo/searchLocation`, etc.) were probed
-against the live API and every one 404'd, and its sibling `restaurant/*` endpoints that do
-exist are currently failing server-side too (same class of issue as the cruise endpoint
-above). OpenStreetMap's Overpass API needs no key, is well-documented, and was verified live
-to return real, named points of interest with usable tags.
+around.** Back when `tripadvisor16.p.rapidapi.com` was still used elsewhere in this app (before
+flight and hotel search both moved to Booking.com -- see above), it was checked live for an
+attractions/things-to-do endpoint before reaching for OpenStreetMap: over a dozen plausible
+paths (`attractions/searchAttractions`, `attraction/searchLocation`, `poi/searchLocation`,
+`tours/searchLocation`, `thingstodo/searchLocation`, etc.) were probed against the live API
+and every one 404'd, and its sibling `restaurant/*` endpoints that do exist were failing
+server-side too. OpenStreetMap's Overpass API needs no key, is well-documented, and was
+verified live to return real, named points of interest with usable tags.
 
 ## Destination discovery (`travel_agent/destination_discovery.py`)
 
@@ -144,11 +147,10 @@ public service) bounded to a couple of minutes while leaving normal operation un
 - `app.py` Streamlit entry point (multi-step: free text -> [discover destinations if none
   named] -> confirm destination/date -> results)
 - `travel_agent/location_resolution.py` destination candidate geocoding, travel-date parsing,
-  and provider-code resolution (Tripadvisor-resolved airport codes, hotel location id, and
-  cruise location id)
-- `travel_agent/data_sources.py` grounding + search API calls (Tripadvisor Flights, Tripadvisor
-  Hotels, Tripadvisor Cruises, visa requirements), gated by relevance (flights only called if an
-  origin was given; cruise only if the request mentions cruising)
+  and provider-code resolution (OurAirports-resolved IATA airport codes turned into Booking.com
+  flight location ids, and Booking.com hotel `dest_id`/`search_type` pairs)
+- `travel_agent/data_sources.py` grounding + search API calls (Booking.com Flights, Booking.com
+  Hotels, visa requirements), gated by relevance (flights only called if an origin was given)
 - `travel_agent/destination_insights.py` the three destination-selection checks (State
   Department advisory, weather outlook, seasonal activities) -- see above
 - `travel_agent/destination_discovery.py` "suggest a destination" search for requests that
@@ -170,14 +172,14 @@ OLLAMA_API_KEY=
 
 RAPIDAPI_KEY=
 
-RAPIDAPI_TRIPADVISOR_HOST=tripadvisor16.p.rapidapi.com
+RAPIDAPI_BOOKING_HOST=booking-com15.p.rapidapi.com
 RAPIDAPI_VISA_HOST=visa-requirement.p.rapidapi.com
 
 DEFAULT_CITIZENSHIP_COUNTRY_CODE=US
 ```
 
-`RAPIDAPI_KEY` is a RapidAPI application key subscribed to both the Tripadvisor
-(`tripadvisor16.p.rapidapi.com`) and Visa Requirements products -- get one from your RapidAPI
+`RAPIDAPI_KEY` is a RapidAPI application key subscribed to the Booking.com
+(`booking-com15.p.rapidapi.com`) and Visa Requirements products -- get one from your RapidAPI
 dashboard.
 
 Only the RapidAPI **host** is configurable per RapidAPI provider -- endpoint paths are
@@ -236,15 +238,16 @@ streamlit run app.py
 2. You confirm one destination and a travel start date (parsed from your text if it was
    explicit there, e.g. "October 15" or "2026-11-03"; otherwise you're asked for one).
 3. Only then does the app resolve real provider codes for that confirmed destination
-   (Tripadvisor-resolved IATA airport codes for flights, a Tripadvisor `geoId` for hotels)
-   and run search:
-   - Hotel/accommodation search always runs: the destination name is resolved to a Tripadvisor
-     `geoId` (`hotels/searchLocation`), then searched with real `checkIn`/`checkOut` dates
-     (`hotels/searchHotels`).
+   (OurAirports-resolved IATA airport codes turned into Booking.com location ids for flights, a
+   Booking.com `dest_id`/`search_type` pair for hotels) and run search:
+   - Hotel/accommodation search always runs, as a two-step Booking.com flow: the destination
+     name is resolved to a matched `dest_id`/`search_type` pair (`hotels/searchDestination`,
+     preferring a "city" entry disambiguated by country code), then both are passed together
+     to `hotels/searchHotels` along with real `arrival_date`/`departure_date` dates.
    - Flight search only runs if you gave an origin city (otherwise there's no route to search);
-     it resolves airport codes via `flights/searchAirport`, then searches via
-     `flights/searchFlights`.
-   - Cruise search only runs if your request mentions cruising.
+     it resolves the nearest real IATA airport codes (OurAirports dataset, by great-circle
+     distance), converts the nearest one to a Booking.com location id via
+     `flights/searchDestination`, then searches via `flights/searchFlights`.
    - Visa search always runs, using the destination's actual country code (resolved during
      geocoding, not a guess).
 
@@ -255,9 +258,11 @@ calls proportional to what the request actually needs.
 ## Rate limits
 
 Live testing surfaced that firing concurrent requests at the *same* host (e.g. resolving
-origin and destination airport codes at the same time, both against Tripadvisor's flight
-airport-search endpoint) can trip that host's rate limit and come back with empty/incomplete
-data rather than a loud error. `travel_agent/http_utils.py` serializes requests per host (a
+origin and destination provider ids at the same time, both against the same RapidAPI product)
+can trip that host's rate limit and come back with empty/incomplete data rather than a loud
+error -- confirmed live against Tripadvisor's hosts on 2026-09-03; the same serialization
+below applies uniformly to every host, including Booking.com's, as a precaution.
+`travel_agent/http_utils.py` serializes requests per host (a
 lock keyed by hostname) to avoid self-inflicted rate limiting -- calls to *different* hosts
 still run fully in parallel. If you see empty search results in bursts, check your RapidAPI
 dashboard for per-product plan/quota/rate limits before assuming the code is wrong.

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from datetime import timedelta
 from textwrap import dedent
 from typing import Awaitable, Callable
@@ -14,11 +13,9 @@ from ollama import AsyncClient as OllamaAsyncClient
 from config import settings
 from .data_sources import gather_grounding_packet
 from .schemas import DEFAULT_TRIP_LENGTH_DAYS, DestinationCandidate, UserTripRequest
-from .search_agents import HotelSearchAgent, FlightSearchAgent, VisaSearchAgent, AirportSearchAgent, CruiseSearchAgent
+from .search_agents import HotelSearchAgent, FlightSearchAgent, VisaSearchAgent, AirportSearchAgent
 
 logger = logging.getLogger(__name__)
-
-_CRUISE_INTEREST_PATTERN = re.compile(r"\bcruis", re.IGNORECASE)
 
 ProgressCallback = Callable[[str], None]
 
@@ -74,7 +71,7 @@ def _deterministic_ranking_rubric() -> str:
         """
         Deterministic ranking rubric (0-100):
         - Rating quality score (0-10) -> weight 40%
-            Use normalized rating values from Tripadvisor Hotels/other provided APIs.
+            Use normalized rating values from Booking.com Hotels/other provided APIs.
             If multiple ratings exist, compute arithmetic mean.
         - Review confidence score (0-10) -> weight 20%
             Combine review volume, recency, and consistency.
@@ -133,9 +130,8 @@ async def build_itineraries(
     check_out = check_in + timedelta(days=trip_length_days)
 
     wants_flights = bool(user_request.origin_city and user_request.origin_city.strip())
-    wants_cruise = bool(_CRUISE_INTEREST_PATTERN.search(user_request.request_text))
 
-    _report(on_progress, "Gathering hotel, flight, visa, cruise, and safety/weather grounding data...")
+    _report(on_progress, "Gathering hotel, flight, visa, and safety/weather grounding data...")
     grounding = await gather_grounding_packet(
         destination,
         request_text=user_request.request_text,
@@ -144,7 +140,6 @@ async def build_itineraries(
         check_in=check_in,
         check_out=check_out,
         wants_flights=wants_flights,
-        wants_cruise=wants_cruise,
     )
     _report(on_progress, "Grounding data gathered.")
 
@@ -154,7 +149,6 @@ async def build_itineraries(
     flight_agent = FlightSearchAgent(client)
     visa_agent = VisaSearchAgent(client)
     airport_agent = AirportSearchAgent(client)
-    cruise_agent = CruiseSearchAgent(client)
 
     safety_agent = Agent(
         name="SafetyAgent",
@@ -177,11 +171,11 @@ async def build_itineraries(
             You are a luxury-on-budget travel planner.
             Build 3 itinerary options that are luxurious, budget-aware, and realistic.
             Include flights when relevant, hotels that are 3-star or better, and local transport guidance.
-            Use all relevant provided API evidence: Tripadvisor Hotels, Tripadvisor Flights,
-            Visa Requirements, and Tripadvisor Cruises (when present).
+            Use all relevant provided API evidence: Booking.com Hotels, Booking.com Flights,
+            and Visa Requirements.
             Prioritize higher-rated options using both source ratings and customer review quality signals
             (review score, review volume, recency, consistency).
-            Prefer accommodation options with strong Tripadvisor Hotels ratings and review confidence.
+            Prefer accommodation options with strong Booking.com Hotels ratings and review confidence.
             Return practical, bookable-seeming plans with transparent cost ranges and clear tradeoffs.
             """
         ).strip(),
@@ -196,7 +190,7 @@ async def build_itineraries(
             Recommend culturally meaningful, destination-unique experiences and dining/activities with safety in mind.
             Avoid generic suggestions.
             Prioritize authentic, high-value experiences backed by reliable public signals
-            (Tripadvisor reviews/ratings, official tourism boards, and other reputable public sources).
+            (Booking.com reviews/ratings, official tourism boards, and other reputable public sources).
             Favor activities with consistently high ratings and positive recent sentiment.
             """
         ).strip(),
@@ -217,9 +211,10 @@ async def build_itineraries(
                     API Data: {grounding.external_api_snippets or 'No data'}
 
                     Hotel Search Requirements:
-                    - Use the accommodation's 'title', 'bubbleRating.rating', and 'bubbleRating.count' for the summary.
-                    - Use 'priceForDisplay'/'priceSummary' for cost, and 'secondaryInfo' for the property's location.
-                    - Reference 'cardPhotos' entries when present.
+                    - Use the accommodation's 'name', 'reviewScore', and 'reviewCount' for the summary.
+                    - Use 'accuratePropertyClass' for the star rating.
+                    - Use 'priceBreakdown.grossPrice' for cost.
+                    - Reference 'photoUrls' entries when present.
 
                     Find the best hotel/accommodation options.
                     """
@@ -236,7 +231,7 @@ async def build_itineraries(
                     API Data: {grounding.external_api_snippets or 'No data'}
 
                     {"Flights were not searched because no origin city was provided." if not wants_flights else ""}
-                    Find the best flight options from the Tripadvisor Flights API data above.
+                    Find the best flight options from the Booking.com Flights API data above.
                     """
                 ).strip(),
             ),
@@ -264,19 +259,6 @@ async def build_itineraries(
                     """
                 ).strip(),
             ),
-            "Cruise search": _run_specialist(
-                cruise_agent,
-                dedent(
-                    f"""
-                    Traveler request: {user_request.request_text}
-                    Destination: {grounding.destination_hint}
-                    API Data: {grounding.external_api_snippets or 'No data'}
-
-                    {"" if wants_cruise else "No cruise interest was detected in the traveler request, so cruise search was skipped -- say so briefly and move on."}
-                    Find the best cruise options. Translate technical logistics into user-friendly summaries.
-                    """
-                ).strip(),
-            ),
         },
         on_progress,
     )
@@ -284,7 +266,6 @@ async def build_itineraries(
     flight_search_results = specialist_results["Flight search"]
     visa_search_results = specialist_results["Visa requirements"]
     airport_search_results = specialist_results["Airport recommendations"]
-    cruise_search_results = specialist_results["Cruise search"]
 
     # safety_brief and experiences_plan only need the grounding packet; logistics_plan
     # needs the specialist results above but not the other two. None of the three
@@ -326,9 +307,6 @@ async def build_itineraries(
 
                     Airport Recommendations:
                     {airport_search_results}
-
-                    Cruise Search Results:
-                    {cruise_search_results}
                     """
                 ).strip(),
             ),
@@ -359,8 +337,8 @@ async def build_itineraries(
             Requirements:
             - Provide exactly 3 itinerary options.
             - Each option must include: target budget range, flight plan (if relevant), hotel plan (3-star+), unique experiences, and local transport recommendation.
-            - Use all relevant provided API evidence in each option: Tripadvisor Hotels,
-              Tripadvisor Flights, Visa Requirements, and Tripadvisor Cruises.
+            - Use all relevant provided API evidence in each option: Booking.com Hotels,
+              Booking.com Flights, and Visa Requirements.
             - Apply the deterministic ranking rubric exactly as provided in the user context.
             - For hotels and activities, explicitly reference rating confidence based on score + review volume.
             - If an API source is missing/unavailable, state that clearly and continue with available evidence.
@@ -401,7 +379,7 @@ async def build_itineraries(
             - Local transport notes: {grounding.local_transport_notes}
             - External APIs: {grounding.external_api_snippets or 'None'}
                         - APIs expected to be considered when available:
-                            Tripadvisor Hotels, Tripadvisor Flights, Visa Requirements, Tripadvisor Cruises
+                            Booking.com Hotels, Booking.com Flights, Visa Requirements
                         - Deterministic rubric to apply exactly:
                             {_deterministic_ranking_rubric()}
             - Source URL that must be included: https://travel.state.gov/content/travel.html
