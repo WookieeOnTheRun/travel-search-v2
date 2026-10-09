@@ -7,3 +7,6 @@ venv/
 # Local secrets — never commit real credentials.
 .env
 travel_agent/main.env
+
+# Local SQLite session/itinerary store
+data/

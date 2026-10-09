@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any
 
 import httpx
@@ -12,33 +13,75 @@ logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-# Serializes requests per host, since _host_lock_for keys purely on hostname. Verified live
-# (2026-09-03) against the RapidAPI hosts used here (Tripadvisor, visa requirements): firing two concurrent
-# requests at the same host reliably triggers 429s that exhaust the retry budget and come
-# back as empty/incomplete data rather than raising -- silently degrading result quality
-# instead of failing loudly. A different host is unaffected, so this only serializes calls
-# that would actually contend for the same upstream rate limit.
+# Upper bound on how long a single backoff may sleep. A server-sent Retry-After is honored up
+# to this limit only: the wait happens while holding the per-host lock, so an unbounded value
+# would stall every other request to that host for as long as the server asked.
+_MAX_BACKOFF_SECONDS = 30.0
+
+# Serializes requests per host. Verified live (2026-09-03) against the RapidAPI hosts used
+# here: firing two concurrent requests at the same host reliably triggers 429s that exhaust
+# the retry budget and come back as empty/incomplete data rather than raising -- silently
+# degrading result quality instead of failing loudly. A different host is unaffected, so this
+# only serializes calls that would actually contend for the same upstream rate limit.
 #
-# Keyed by (running event loop id, host) rather than just host: callers here (e.g.
-# Streamlit's app.py) call asyncio.run() fresh on every script rerun, which creates
-# a brand-new event loop each time. An asyncio.Lock is bound to the loop it's first
-# used on, so a plain host-keyed dict -- which outlives any single asyncio.run() call
-# -- would hand a later rerun a lock object still bound to a previous, now-closed
-# loop and crash with "bound to a different event loop" the moment two concurrent
-# calls to the same host contend for it (verified live -- this is exactly what
-# happened to the concurrent historical-weather calls in destination_insights.py
-# once Streamlit was actually run through more than one rerun).
-_host_locks: dict[tuple[int, str], asyncio.Lock] = {}
+# Locks are kept per event loop: Streamlit's app.py calls asyncio.run() on every script rerun,
+# which creates a brand-new loop each time, and an asyncio.Lock that has been contended on one
+# loop raises "bound to a different event loop" if used on another. Keying on the loop object
+# itself (not id(loop), which Python only guarantees unique among objects alive at the same
+# time, so a new loop could reuse a closed loop's id and be handed its stale lock) rules that
+# out. A WeakKeyDictionary is not enough on its own here: a used asyncio.Lock holds a strong
+# reference to its loop, so the entries would never be freed. Instead, closed loops' entries
+# are pruned on each lookup. Streamlit runs each browser session's script on its own thread,
+# so the shared map is guarded by a threading.Lock.
+_host_locks: dict[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = {}
+_host_locks_guard = threading.Lock()
 
 
-async def _host_lock_for(url: str) -> asyncio.Lock:
+def _host_lock_for(url: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
     host = httpx.URL(url).host
-    key = (id(asyncio.get_running_loop()), host)
-    lock = _host_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _host_locks[key] = lock
-    return lock
+    with _host_locks_guard:
+        for stale_loop in [known for known in _host_locks if known.is_closed()]:
+            del _host_locks[stale_loop]
+        loop_locks = _host_locks.setdefault(loop, {})
+        if host not in loop_locks:
+            loop_locks[host] = asyncio.Lock()
+        return loop_locks[host]
+
+
+# Shared retry loop for GET and POST: bounded attempts, backoff on transport errors and
+# retryable status codes (honoring Retry-After, capped), immediate raise on any other 4xx/5xx.
+async def _request_with_retry(
+    client: httpx.AsyncClient, method: str, url: str, *, max_attempts: int, **request_kwargs: Any
+) -> httpx.Response:
+    async with _host_lock_for(url):
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                response = await client.request(method, url, **request_kwargs)
+            except httpx.TransportError:
+                if attempt >= max_attempts:
+                    raise
+                await asyncio.sleep(2 ** (attempt - 1))
+                continue
+
+            if response.status_code not in _RETRYABLE_STATUS_CODES or attempt >= max_attempts:
+                response.raise_for_status()
+                return response
+
+            retry_after = response.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** (attempt - 1)
+            delay = min(delay, _MAX_BACKOFF_SECONDS)
+            logger.warning(
+                "Retryable status %s from %s (attempt %s/%s), backing off %.1fs",
+                response.status_code,
+                url,
+                attempt,
+                max_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
 
 
 async def get_with_retry(
@@ -53,37 +96,9 @@ async def get_with_retry(
 
     Non-retryable failures (4xx other than 429) raise immediately.
     """
-    async with await _host_lock_for(url):
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                response = await client.get(url, params=params, headers=headers)
-            except httpx.TransportError:
-                if attempt >= max_attempts:
-                    raise
-                await asyncio.sleep(2 ** (attempt - 1))
-                continue
-
-            if response.status_code not in _RETRYABLE_STATUS_CODES:
-                response.raise_for_status()
-                return response
-
-            if attempt >= max_attempts:
-                response.raise_for_status()
-                return response
-
-            retry_after = response.headers.get("Retry-After")
-            delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** (attempt - 1)
-            logger.warning(
-                "Retryable status %s from %s (attempt %s/%s), backing off %.1fs",
-                response.status_code,
-                url,
-                attempt,
-                max_attempts,
-                delay,
-            )
-            await asyncio.sleep(delay)
+    return await _request_with_retry(
+        client, "GET", url, max_attempts=max_attempts, params=params, headers=headers
+    )
 
 
 async def post_with_retry(
@@ -100,37 +115,9 @@ async def post_with_retry(
     Pass exactly one of `json` (JSON body) or `data` (form-encoded body) depending on what the
     target API expects.
     """
-    async with await _host_lock_for(url):
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                response = await client.post(url, json=json, data=data, headers=headers)
-            except httpx.TransportError:
-                if attempt >= max_attempts:
-                    raise
-                await asyncio.sleep(2 ** (attempt - 1))
-                continue
-
-            if response.status_code not in _RETRYABLE_STATUS_CODES:
-                response.raise_for_status()
-                return response
-
-            if attempt >= max_attempts:
-                response.raise_for_status()
-                return response
-
-            retry_after = response.headers.get("Retry-After")
-            delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** (attempt - 1)
-            logger.warning(
-                "Retryable status %s from %s (attempt %s/%s), backing off %.1fs",
-                response.status_code,
-                url,
-                attempt,
-                max_attempts,
-                delay,
-            )
-            await asyncio.sleep(delay)
+    return await _request_with_retry(
+        client, "POST", url, max_attempts=max_attempts, json=json, data=data, headers=headers
+    )
 
 
 def describe_error(ex: Exception) -> str:

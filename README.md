@@ -18,7 +18,9 @@ This project builds a travel concierge workflow that:
 - uses a multi-agent workflow to generate 3 itinerary options,
 - includes flights (if an origin city was given), 3-star+ hotel recommendations, unique activities,
 - recommends local transportation options,
-- prioritizes luxury experience within budget and traveler safety.
+- prioritizes luxury experience within budget and traveler safety,
+- lets the user save generated results into named itineraries and browse them all in one
+  place (see "Saved itineraries" below).
 
 Flight and hotel/accommodation search both run against the **Booking.com API via RapidAPI**
 (`booking-com15.p.rapidapi.com` -- endpoint paths and parameter contracts verified against the
@@ -110,7 +112,8 @@ The pipeline is deliberately split so an LLM only ever proposes *names*, never *
      speed references put average block speed around 400-500mph; road-trip planning guidance
      converges on ~55-65mph for long-distance driving) used only to size the initial net;
      surviving candidates get a **real routed drive time from OSRM**
-     (`router.project-osrm.org`, free/keyless) rather than trusting the estimate.
+     (`https://router.project-osrm.org`, free/keyless, called over HTTPS) rather than
+     trusting the estimate.
    - **Warmth**: reuses `destination_insights.fetch_weather_outlook`'s real historical
      averages for the requested dates; candidates below the app's documented warm-weather
      threshold (24°C/75°F average high -- a stated design choice, not an external authority)
@@ -145,7 +148,12 @@ public service) bounded to a couple of minutes while leaving normal operation un
 
 - `config.py` model + endpoint configuration
 - `app.py` Streamlit entry point (multi-step: free text -> [discover destinations if none
-  named] -> confirm destination/date -> results)
+  named] -> confirm destination/date -> results), plus the itinerary sidebar, single-itinerary
+  view, and "All itineraries" view
+- `travel_agent/persistence.py` SQLite store for per-session itineraries and their saved
+  searches (see "Saved itineraries" below)
+- `.streamlit/config.toml` beta-deployment hardening for the Streamlit UI (see "Beta
+  deployment notes" below)
 - `travel_agent/location_resolution.py` destination candidate geocoding, travel-date parsing,
   and provider-code resolution (OurAirports-resolved IATA airport codes turned into Booking.com
   flight location ids, and Booking.com hotel `dest_id`/`search_type` pairs)
@@ -176,7 +184,18 @@ RAPIDAPI_BOOKING_HOST=booking-com15.p.rapidapi.com
 RAPIDAPI_VISA_HOST=visa-requirement.p.rapidapi.com
 
 DEFAULT_CITIZENSHIP_COUNTRY_CODE=US
+
+# Optional: where the itinerary database lives (default: data/travel_sessions.db)
+# SESSION_DB_PATH=
 ```
+
+The first env file found is loaded, in this order: the path in `TRAVEL_AGENT_ENV_FILE`,
+`travel_agent/main.env`, then `.env`. **A variable already set in the real process
+environment always wins over the file** (python-dotenv's `override=False`), so on a deployed
+host, values set through the platform's own secret/config settings are never replaced by a
+stale env file shipped with the code. Which env file was loaded is logged server-side at
+startup (it is not shown in the UI). A blank value (`KEY=`) in an env file counts as unset
+and falls back to the built-in default, so `.env.example` can be copied as-is.
 
 `RAPIDAPI_KEY` is a RapidAPI application key subscribed to the Booking.com
 (`booking-com15.p.rapidapi.com`) and Visa Requirements products -- get one from your RapidAPI
@@ -222,12 +241,26 @@ missing rather than silently failing partway through a request.
 
 ## Run
 
+Windows (PowerShell):
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+Linux/macOS (including Codespaces):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+Run `streamlit run` from the project root so `.streamlit/config.toml` is picked up --
+Streamlit reads that file from the directory it is launched from.
 
 ## How search works
 
@@ -255,6 +288,67 @@ This relevance gating -- plus resolving each destination's codes once and reusin
 rather than re-deriving them per search call -- is what keeps the number of outbound API
 calls proportional to what the request actually needs.
 
+## Saved itineraries
+
+Generated results can be filed into named itineraries, managed from the **Itineraries**
+sidebar:
+
+- **Saving.** A generated result lives only in the browser session until you use **Save this
+  search to an itinerary** on the results screen -- pick an existing itinerary, or choose
+  "New itinerary" and give it a name (unique per session, case-insensitive, up to 80
+  characters; letters, numbers, spaces and `- . , ' & ( ) / : ? +` only -- Streamlit renders
+  names as Markdown, and this rule is what keeps a name from carrying a link or an image). Nothing is written to the database for a search that is never saved; "Start
+  over" discards it. The same result can be saved to more than one itinerary. A search is
+  only ever stored together with its itinerary link, in a single transaction.
+- **Viewing.** Each itinerary has its own button in the sidebar (opens that itinerary and its
+  saved searches). **All itineraries** lists every itinerary in the session together, each
+  with its saved searches and an Open button. Saved searches are snapshots: prices and
+  availability are as of when the search ran, not live quotes.
+- **Creating an empty itinerary.** The sidebar's "New itinerary name" form creates one with no
+  searches yet.
+- **Retention.** An itinerary is kept for 72 hours after its last change (creation or the most
+  recent search added to it), then hidden immediately and deleted on the next cleanup, which
+  runs when any new browser session starts. Searches no longer in any itinerary are deleted in
+  the same cleanup.
+- **Sessions.** There are no accounts. Each browser session gets a random id (a UUID4) carried
+  in the page URL as `?sid=...`, so a refresh keeps the same itineraries. Opening the app
+  without that parameter starts a new, empty session; bookmark the full URL to come back.
+  **Anyone holding the full URL can see and add to that session's itineraries -- don't share
+  it.**
+- **Storage.** A local SQLite file (`SESSION_DB_PATH`, default `data/travel_sessions.db`,
+  gitignored). It is only as durable as the disk it sits on: a host or container without a
+  persistent disk loses every itinerary on restart, and it is not shared across multiple app
+  instances.
+- **Error logging.** Every failed itinerary action (listing, creating, saving, opening,
+  displaying) logs one line to the server console -- `Itinerary action failed: <action>
+  (<error type>) session_id=<first 8 chars>… itinerary_id=...`. Only a prefix of the
+  session id is logged, since the full id is what grants access to that session's
+  itineraries. Expected failures (blank/duplicate name,
+  expired itinerary) are logged without a traceback; anything unexpected includes one.
+  Itinerary names are never logged, since they are free-form user input.
+
+## Beta deployment notes
+
+- **Error display.** `.streamlit/config.toml` sets `client.showErrorDetails = "none"`, so
+  an uncaught exception shows testers only a generic message; the full traceback still prints
+  to the server console. It also sets `client.toolbarMode = "viewer"` (hides developer menu
+  items) and `browser.gatherUsageStats = false`. Values were checked against
+  `streamlit config show` for the pinned Streamlit 1.43.2.
+- **Input limits.** The travel request is capped at 2,000 characters and the origin city at
+  100, enforced in the browser and re-checked on the server. The request text is sent to every
+  LLM agent, so this bounds per-search cost and latency.
+- **LLM output.** The final itinerary is model-generated markdown rendered with
+  `st.markdown`, whose default (`unsafe_allow_html=False`) escapes any HTML in it.
+  Upstream API data (hotels, flights, visa results) is passed into prompts as text, so the
+  model's output should still be read as suggestions to verify, not trusted facts.
+- **Logging.** `app.py` configures logging once at INFO level with timestamps (stderr), so
+  the "which env file loaded" line, upstream-service warnings and itinerary errors all show
+  in the server console. The `httpx` logger is deliberately held at WARNING: at INFO it logs
+  every request URL including its query string, which for this app carries travelers'
+  free-text requests and destinations. Keep it that way if you change the logging setup.
+- **Secrets.** See "Configure" above -- keys come from the environment/env file only and are
+  never rendered in the UI.
+
 ## Rate limits
 
 Live testing surfaced that firing concurrent requests at the *same* host (e.g. resolving
@@ -273,7 +367,15 @@ interaction), which creates a brand-new event loop each time; a lock object crea
 run is bound to that run's loop and crashes with "bound to a different event loop" if a
 later run tries to reuse it. This was caught live once the destination-selection weather
 check (which fires three concurrent requests at the same Open-Meteo host) was actually run
-through more than one Streamlit rerun -- see `_host_lock_for` in `http_utils.py`.
+through more than one Streamlit rerun. Locks are keyed by the loop object itself (not its
+`id()`, which Python may reuse once a loop is gone), entries for closed loops are pruned on
+each lookup so they don't accumulate, and the shared map is guarded by a thread lock because
+Streamlit runs each browser session on its own thread -- see `_host_lock_for` in
+`http_utils.py`.
+
+Retries back off exponentially and honor a server's `Retry-After` header, capped at 30
+seconds per wait (the wait holds that host's lock, so an uncapped value would stall every
+other request to the same host).
 
 ## Safety Grounding Notes
 

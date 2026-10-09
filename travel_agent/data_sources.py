@@ -491,7 +491,7 @@ async def gather_grounding_packet(
         try:
             weather_summary = await weather_task
         except Exception as ex:
-            logger.warning("Weather fetch failed for %s: %s", destination.name, ex)
+            logger.warning("Weather fetch failed for %s: %s", destination.name, describe_error(ex))
             weather_summary = "Weather feed temporarily unavailable."
 
         safety_summary = "Advisory feed unavailable. Manually verify current travel advisories at travel.state.gov."
@@ -501,7 +501,7 @@ async def gather_grounding_packet(
             try:
                 safety_summary, advisory_level, advisory_source_url = await safety_task
             except Exception as ex:
-                logger.warning("Safety advisory fetch failed for %s: %s", destination.name, ex)
+                logger.warning("Safety advisory fetch failed for %s: %s", destination.name, describe_error(ex))
 
         codes = await codes_task
 

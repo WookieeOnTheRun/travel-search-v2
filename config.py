@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,7 +9,10 @@ from typing import List
 from dotenv import load_dotenv
 
 
-# Environment loading logic to find and load .env files from multiple candidate paths
+# Loads the first env file found (TRAVEL_AGENT_ENV_FILE, then travel_agent/main.env, then
+# .env). override=False (python-dotenv's default) means a variable already set in the real
+# process environment wins over the file -- so on a deployed host, secrets/config set by the
+# platform are never silently replaced by a stale env file shipped alongside the code.
 def _load_environment() -> Path | None:
     project_root = Path(__file__).resolve().parent
     explicit_env_path = os.getenv("TRAVEL_AGENT_ENV_FILE", "").strip()
@@ -26,14 +30,37 @@ def _load_environment() -> Path | None:
 
     for candidate in candidates:
         if candidate.exists():
-            load_dotenv(dotenv_path=candidate, override=True)
+            load_dotenv(dotenv_path=candidate, override=False)
             return candidate
 
-    load_dotenv(override=True)
+    load_dotenv(override=False)
     return None
 
 
+# One-time logging setup for the whole process, done here because config is the first project
+# module every other one imports -- so it runs before any log line is emitted. Python's root
+# logger has no handler by default: without this, only WARNING+ would reach stderr (via the
+# last-resort handler, with no timestamps) and INFO lines would never print. basicConfig is a
+# no-op once the root logger has a handler, so Streamlit's reruns can't add duplicates. httpx
+# is pinned to WARNING: at INFO it logs every request's full URL, and for this app the query
+# string carries the traveler's free-text request.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 ENV_FILE_IN_USE = _load_environment()
+# Logged once per process at import, server-side only -- the env file's path is deliberately
+# not shown in the UI, since it discloses the server's filesystem layout to every visitor.
+logging.getLogger(__name__).info(
+    "Env file in use: %s", ENV_FILE_IN_USE or "none (process environment only)"
+)
+
+
+# A `KEY=` line in an env file sets the variable to "" (python-dotenv behaviour, verified), and
+# os.getenv(key, default) returns that "" rather than the default -- so every setting with a
+# default goes through this, and a blank value in a copied .env.example can't produce a broken
+# "https:///..." URL or a float("") crash at import.
+def _env(name: str, default: str) -> str:
+    return os.getenv(name, "").strip() or default
 
 
 @dataclass(slots=True)
@@ -46,8 +73,8 @@ class Settings:
     # "https://ollama.com/api" -- the latter produces a broken double "/api/api/..." path.
     # The documented raw-HTTP base URL ("https://ollama.com/api/...", as in the official curl
     # example) only applies to direct HTTP calls, not to this SDK's host parameter.
-    ollama_model: str = os.getenv("OLLAMA_MODEL", "gemma4:cloud")
-    ollama_host: str = os.getenv("OLLAMA_HOST", "https://ollama.com")
+    ollama_model: str = _env("OLLAMA_MODEL", "gemma4:cloud")
+    ollama_host: str = _env("OLLAMA_HOST", "https://ollama.com")
     # Ollama Cloud authenticates every request with `Authorization: Bearer <OLLAMA_API_KEY>`
     # (see https://docs.ollama.com/api/authentication). Create a key at
     # https://ollama.com/settings/keys. Server-side only: never log it, never render it in
@@ -63,11 +90,11 @@ class Settings:
     )
     travel_api_key: str = os.getenv("TRAVEL_API_KEY", "")
     rapidapi_key: str = os.getenv("RAPIDAPI_KEY", os.getenv("TRAVEL_API_KEY", ""))
-    request_timeout_seconds: float = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+    request_timeout_seconds: float = float(_env("REQUEST_TIMEOUT_SECONDS", "20"))
 
-    default_currency: str = os.getenv("DEFAULT_CURRENCY", "USD")
-    default_locale: str = os.getenv("DEFAULT_LOCALE", "en-US")
-    default_citizenship_country_code: str = os.getenv("DEFAULT_CITIZENSHIP_COUNTRY_CODE", "US")
+    default_currency: str = _env("DEFAULT_CURRENCY", "USD")
+    default_locale: str = _env("DEFAULT_LOCALE", "en-US")
+    default_citizenship_country_code: str = _env("DEFAULT_CITIZENSHIP_COUNTRY_CODE", "US")
 
     # Each of these hosts + the fixed endpoint paths in travel_agent/location_resolution.py
     # and travel_agent/data_sources.py were verified against the live RapidAPI products on
@@ -86,8 +113,15 @@ class Settings:
     # searchFlights: HTTP 200 with a `{"status": false, ...}` error body for every valid
     # request), and Tripadvisor is no longer used for hotels either so the app depends on a
     # single flight+hotel provider instead of two.
-    rapidapi_booking_host: str = os.getenv("RAPIDAPI_BOOKING_HOST", "booking-com15.p.rapidapi.com")
-    rapidapi_visa_host: str = os.getenv("RAPIDAPI_VISA_HOST", "visa-requirement.p.rapidapi.com")
+    rapidapi_booking_host: str = _env("RAPIDAPI_BOOKING_HOST", "booking-com15.p.rapidapi.com")
+    rapidapi_visa_host: str = _env("RAPIDAPI_VISA_HOST", "visa-requirement.p.rapidapi.com")
+
+    # SQLite file holding per-session search runs and itineraries (see
+    # travel_agent/persistence.py). Nothing here is meant to outlive the host: on a container
+    # or host without a persistent disk, a restart wipes every session's itineraries.
+    session_db_path: str = _env(
+        "SESSION_DB_PATH", str(Path(__file__).resolve().parent / "data" / "travel_sessions.db")
+    )
 
 
 settings = Settings()

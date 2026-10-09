@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 import streamlit as st
 
-from config import ENV_FILE_IN_USE, settings
+from config import settings
 from travel_agent import (
     DEFAULT_TRIP_LENGTH_DAYS,
     DestinationCandidate,
@@ -25,6 +25,17 @@ from travel_agent import (
     resolve_destination_candidates,
 )
 from travel_agent.destination_discovery import parse_trip_constraints
+from travel_agent.http_utils import describe_error
+from travel_agent.persistence import (
+    DuplicateItineraryNameError,
+    ItineraryNotFoundError,
+    MAX_ITINERARY_NAME_LENGTH,
+    SearchRun,
+    SearchRunNotFoundError,
+    SessionStore,
+    is_valid_session_id,
+    new_session_id,
+)
 from travel_agent.schemas import (
     ActivitySearchResult,
     AdvisoryCheck,
@@ -36,6 +47,20 @@ from travel_agent.units import format_temp_c
 logger = logging.getLogger(__name__)
 
 _NEAREST_AIRPORTS_COUNT = 5
+
+# Input size limits. The request text is sent verbatim to every LLM agent (several prompts per
+# search) and into upstream API query params, so its length directly drives cost and latency.
+# Streamlit enforces max_chars in the browser; the same limits are re-checked server-side on
+# submit, since the browser is not a trust boundary.
+_MAX_REQUEST_CHARS = 2000
+_MAX_ORIGIN_CHARS = 100
+
+# URL query parameter carrying this browser's anonymous session id. Streamlit can't set
+# cookies, and its own session ends on every page refresh, so the id rides in the URL to
+# survive refreshes. Anyone holding the full URL can see that session's itineraries -- fine
+# for testing, but don't share the link.
+_SESSION_QUERY_PARAM = "sid"
+_NEW_ITINERARY_OPTION = "➕ New itinerary…"
 
 
 # Helper to parse a single markdown table row into a list of cells
@@ -184,11 +209,13 @@ async def _gather_destination_insights(
         results = await _gather_tracked(jobs, on_progress)
 
     return {
-        "advisory": results["advisory"] if not isinstance(results["advisory"], Exception) else AdvisoryCheck(error=str(results["advisory"])),
-        "weather": results["weather"] if not isinstance(results["weather"], Exception) else WeatherOutlook(error=str(results["weather"])),
+        # describe_error, not str(): these messages are shown on screen, and a raw HTTP error
+        # embeds the full request URL including its query string.
+        "advisory": results["advisory"] if not isinstance(results["advisory"], Exception) else AdvisoryCheck(error=describe_error(results["advisory"])),
+        "weather": results["weather"] if not isinstance(results["weather"], Exception) else WeatherOutlook(error=describe_error(results["weather"])),
         "airports": results["airports"] if not isinstance(results["airports"], Exception) else [],
         "activities": (
-            (results["activities"] if not isinstance(results["activities"], Exception) else ActivitySearchResult(error=str(results["activities"])))
+            (results["activities"] if not isinstance(results["activities"], Exception) else ActivitySearchResult(error=describe_error(results["activities"])))
             if include_activities
             else ActivitySearchResult()
         ),
@@ -209,6 +236,8 @@ def _reset() -> None:
         "discovery_result",
         "discovery_start_date",
         "discovery_end_date",
+        "result_run_id",
+        "result_travel_start_date",
     ):
         st.session_state.pop(key, None)
     st.session_state.stage = "intake"
@@ -371,6 +400,246 @@ def _render_destination_insights(
         st.caption("No named attractions were found nearby in OpenStreetMap data for this destination.")
 
 
+@st.cache_resource
+def _get_session_store() -> SessionStore:
+    return SessionStore(settings.session_db_path)
+
+
+# Resolves this browser session's anonymous id: reuses a well-formed id from the URL (so a
+# refresh keeps the same itineraries), otherwise mints a new one. Expired rows are purged
+# once per Streamlit session, here, rather than on a schedule -- the store already hides
+# expired rows at read time, so the purge only reclaims space.
+def _ensure_session_id(store: SessionStore) -> str:
+    if "session_id" not in st.session_state:
+        candidate = st.query_params.get(_SESSION_QUERY_PARAM)
+        session_id = candidate if is_valid_session_id(candidate) else new_session_id()
+        try:
+            store.purge_expired()
+            store.touch_session(session_id)
+        except Exception:
+            logger.exception("Session store initialization failed")
+        st.session_state.session_id = session_id
+    if st.query_params.get(_SESSION_QUERY_PARAM) != st.session_state.session_id:
+        st.query_params[_SESSION_QUERY_PARAM] = st.session_state.session_id
+    return st.session_state.session_id
+
+
+# Shows (once) a confirmation queued before an st.rerun(), so the sidebar and page re-render
+# with the change already applied instead of showing stale itinerary data.
+def _flash(message: str) -> None:
+    st.session_state.flash = message
+
+
+def _show_flash() -> None:
+    message = st.session_state.pop("flash", None)
+    if message:
+        st.success(message)
+
+
+def _hours_ago(moment: datetime) -> str:
+    hours = (datetime.now(timezone.utc) - moment).total_seconds() / 3600
+    if hours < 1:
+        return f"{max(int(hours * 60), 0)} min ago"
+    return f"{int(hours)} h ago"
+
+
+def _hours_left(moment: datetime) -> int:
+    return max(int((moment - datetime.now(timezone.utc)).total_seconds() // 3600), 0)
+
+
+# Logs a failed itinerary action. Expected failures (a blank/duplicate name, an expired
+# itinerary) are logged without a traceback; anything else gets one. Itinerary names are
+# free-form user input, so only ids and the exception type are logged, never the name.
+def _log_itinerary_failure(action: str, exc: Exception, **ids: str | None) -> None:
+    # The session id is the access token for that session's itineraries (it rides in the URL),
+    # so only a short prefix is logged -- enough to correlate entries, not enough to reuse.
+    context = " ".join(
+        f"{key}={value[:8] + '…' if key == 'session_id' else value}" for key, value in ids.items() if value
+    )
+    expected = isinstance(exc, (ValueError, LookupError))
+    logger.error(
+        "Itinerary action failed: %s (%s) %s", action, type(exc).__name__, context, exc_info=not expected
+    )
+
+
+_ITINERARY_VIEWS = ("itinerary", "all_itineraries")
+
+
+# Switches to an itinerary view, remembering which stage to return to so browsing
+# itineraries mid-search doesn't throw the in-progress search away.
+def _open_view(stage: str) -> None:
+    if st.session_state.stage not in _ITINERARY_VIEWS:
+        st.session_state.return_stage = st.session_state.stage
+    st.session_state.stage = stage
+
+
+def _open_itinerary(itinerary_id: str) -> None:
+    st.session_state.viewing_itinerary_id = itinerary_id
+    _open_view("itinerary")
+
+
+def _render_itinerary_sidebar(store: SessionStore, session_id: str) -> None:
+    with st.sidebar:
+        st.header("Itineraries")
+        st.caption("Itineraries changed in the last 72 hours. Older ones are removed automatically.")
+
+        try:
+            itineraries = store.list_recent_itineraries(session_id)
+        except Exception as exc:
+            _log_itinerary_failure("list itineraries", exc, session_id=session_id)
+            st.error("Itineraries are unavailable right now.")
+            return
+
+        if st.button(
+            "📚 All itineraries",
+            key="open_all_itineraries",
+            use_container_width=True,
+            type="primary" if st.session_state.stage == "all_itineraries" else "secondary",
+        ):
+            _open_view("all_itineraries")
+            st.rerun()
+
+        if not itineraries:
+            st.caption("No itineraries yet -- save a search result to start one.")
+        for itinerary in itineraries:
+            if st.button(
+                itinerary.name,
+                key=f"open_itinerary_{itinerary.itinerary_id}",
+                help=(
+                    f"{itinerary.run_count} saved search(es) · changed {_hours_ago(itinerary.updated_at)} · "
+                    f"expires in ~{_hours_left(itinerary.expires_at)} h"
+                ),
+                use_container_width=True,
+                type="primary" if itinerary.itinerary_id == st.session_state.get("viewing_itinerary_id")
+                and st.session_state.stage == "itinerary" else "secondary",
+            ):
+                _open_itinerary(itinerary.itinerary_id)
+                st.rerun()
+
+        with st.form("sidebar_new_itinerary", clear_on_submit=True):
+            name = st.text_input("New itinerary name", max_chars=MAX_ITINERARY_NAME_LENGTH)
+            if st.form_submit_button("Create itinerary"):
+                try:
+                    itinerary_id = store.create_itinerary(session_id, name)
+                except (DuplicateItineraryNameError, ValueError) as exc:
+                    _log_itinerary_failure("create itinerary", exc, session_id=session_id)
+                    st.error(str(exc))
+                except Exception as exc:
+                    _log_itinerary_failure("create itinerary", exc, session_id=session_id)
+                    st.error("The itinerary couldn't be created. Please try again.")
+                else:
+                    _flash(f'Created itinerary "{" ".join(name.split())}".')
+                    _open_itinerary(itinerary_id)
+                    st.rerun()
+
+
+# Lets the user save the current search result into an existing itinerary or a newly named
+# one. Nothing is stored until this form is submitted; the first save stores the result and
+# later saves file that same stored run into further itineraries.
+def _render_save_to_itinerary(
+    store: SessionStore, session_id: str, result: dict[str, Any], travel_start_date: date | None
+) -> None:
+    try:
+        itineraries = store.list_recent_itineraries(session_id)
+    except Exception as exc:
+        _log_itinerary_failure("list itineraries", exc, session_id=session_id)
+        st.error("Itineraries are unavailable right now, so this search can't be saved.")
+        return
+
+    run_id = st.session_state.get("result_run_id")
+    if run_id is None:
+        st.caption("This search isn't saved yet -- it's discarded on \"Start over\" unless saved to an itinerary.")
+    # Keyed by a per-search counter (bumped each time a new result is generated) so every new
+    # search gets a fresh form instead of inheriting the previous one's widget state.
+    form_key = f"save_result_{st.session_state.get('result_seq', 0)}"
+    with st.form(form_key, clear_on_submit=True):
+        st.markdown("**Save this search to an itinerary**")
+        choice = st.selectbox(
+            "Itinerary", [_NEW_ITINERARY_OPTION] + [i.name for i in itineraries], key=f"{form_key}_choice"
+        )
+        new_name = st.text_input(
+            "New itinerary name (used when \"New itinerary\" is selected)",
+            max_chars=MAX_ITINERARY_NAME_LENGTH,
+            key=f"{form_key}_name",
+        )
+        if not st.form_submit_button("Save to itinerary"):
+            return
+
+    itinerary_id = None
+    try:
+        if choice == _NEW_ITINERARY_OPTION:
+            itinerary_id = store.create_itinerary(session_id, new_name)
+            target_name = " ".join(new_name.split())
+        elif new_name.strip():
+            # A typed name with an existing itinerary selected is ambiguous -- refuse rather than
+            # silently ignore the name and file the search somewhere the user didn't intend.
+            raise ValueError(
+                'Choose "New itinerary" to use the name you typed, or clear the name to save to '
+                f'"{choice}".'
+            )
+        else:
+            target = next(i for i in itineraries if i.name == choice)
+            itinerary_id, target_name = target.itinerary_id, target.name
+        if run_id is None:
+            st.session_state.result_run_id = store.save_search_to_itinerary(
+                session_id, itinerary_id, result, travel_start_date
+            )
+        else:
+            store.add_run_to_itinerary(session_id, itinerary_id, run_id)
+    except (DuplicateItineraryNameError, ValueError) as exc:
+        _log_itinerary_failure("save search", exc, session_id=session_id, itinerary_id=itinerary_id)
+        st.error(str(exc))
+    except (ItineraryNotFoundError, SearchRunNotFoundError) as exc:
+        _log_itinerary_failure("save search", exc, session_id=session_id, itinerary_id=itinerary_id, run_id=run_id)
+        st.error("That itinerary or search has expired. Please refresh and try again.")
+    except Exception as exc:
+        _log_itinerary_failure("save search", exc, session_id=session_id, itinerary_id=itinerary_id, run_id=run_id)
+        st.error("This search couldn't be saved. Please try again.")
+    else:
+        _flash(f'Saved to itinerary "{target_name}".')
+        st.rerun()
+
+
+def _render_search_result(result: dict[str, Any]) -> None:
+    st.subheader(f"Destination focus: {result['destination']}")
+    st.markdown(result["itinerary_markdown"])
+
+    score_rows = _extract_scoring_table(result["itinerary_markdown"])
+    if score_rows:
+        st.subheader("Deterministic Score Breakdown")
+        st.dataframe(score_rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("Scoring table not available for this run.")
+
+    st.divider()
+    st.caption("Safety grounding")
+    st.write(result["safety_summary"])
+    st.write(f"Primary advisory source: {result['advisory_source_url']}")
+
+
+def _render_stored_run(run: SearchRun) -> None:
+    st.caption(
+        f"Searched {_hours_ago(run.created_at)}. Prices and availability are a snapshot from that "
+        "time, not live quotes."
+    )
+    try:
+        _render_search_result(run.result)
+    except Exception as exc:
+        _log_itinerary_failure("render saved search", exc, run_id=run.run_id)
+        st.error("This saved search couldn't be displayed.")
+
+
+# Lists an itinerary's saved searches, or returns None (after logging and showing an error)
+# if they can't be loaded.
+def _load_itinerary_runs(store: SessionStore, session_id: str, itinerary_id: str) -> list[SearchRun] | None:
+    try:
+        return store.list_itinerary_runs(session_id, itinerary_id)
+    except Exception as exc:
+        _log_itinerary_failure("list saved searches", exc, session_id=session_id, itinerary_id=itinerary_id)
+        st.error("This itinerary's saved searches are unavailable right now.")
+        return None
+
+
 # UI Configuration and Page Setup
 st.set_page_config(page_title="Agentic Travel Concierge", page_icon="🧳", layout="wide")
 
@@ -380,13 +649,14 @@ st.write(
     "The app identifies matching destinations for you to confirm, then generates multiple "
     "luxury-within-budget itinerary options with safety-aware guidance."
 )
-if ENV_FILE_IN_USE:
-    st.caption(f"ENV file in use: {ENV_FILE_IN_USE}")
-else:
-    st.caption("ENV file in use: default process environment (no env file found)")
 
 if "stage" not in st.session_state:
     st.session_state.stage = "intake"
+
+session_store = _get_session_store()
+session_id = _ensure_session_id(session_store)
+_render_itinerary_sidebar(session_store, session_id)
+_show_flash()
 
 # --- Stage 1: free-text intake -----------------------------------------------------
 if st.session_state.stage == "intake":
@@ -394,6 +664,7 @@ if st.session_state.stage == "intake":
         request_text = st.text_area(
             "Travel request",
             height=180,
+            max_chars=_MAX_REQUEST_CHARS,
             placeholder=(
                 "Example: Plan a 7-day honeymoon in Japan from Seattle for 2 travelers with a total budget under $7000, "
                 "moderate weather, food tours, ryokan stay, and low-risk neighborhoods."
@@ -404,7 +675,8 @@ if st.session_state.stage == "intake":
         with col1:
             origin_city = st.text_input(
                 "Origin city (optional for flight search; required if you want us to suggest "
-                "destinations instead of naming one)"
+                "destinations instead of naming one)",
+                max_chars=_MAX_ORIGIN_CHARS,
             )
         with col2:
             trip_length_days = st.number_input("Trip length (days, optional)", min_value=0, max_value=60, value=0)
@@ -425,6 +697,11 @@ if st.session_state.stage == "intake":
     if submitted:
         if len(request_text.strip()) < 10:
             st.warning("Please provide a more detailed request.")
+        elif len(request_text) > _MAX_REQUEST_CHARS or len(origin_city) > _MAX_ORIGIN_CHARS:
+            st.warning(
+                f"Please keep the request under {_MAX_REQUEST_CHARS} characters and the origin city "
+                f"under {_MAX_ORIGIN_CHARS}."
+            )
         else:
             candidates: list[DestinationCandidate] = []
             parsed_date: date | None = None
@@ -643,6 +920,11 @@ elif st.session_state.stage == "confirm":
                 )
 
         if result is not None:
+            # The result is only held in this browser session; it's stored when (and only if)
+            # the user saves it to an itinerary from the results screen.
+            st.session_state.pop("result_run_id", None)
+            st.session_state.result_seq = st.session_state.get("result_seq", 0) + 1
+            st.session_state.result_travel_start_date = travel_start_date
             st.session_state.result = result
             st.session_state.stage = "results"
             st.rerun()
@@ -655,17 +937,75 @@ elif st.session_state.stage == "results":
         _reset()
         st.rerun()
 
-    st.subheader(f"Destination focus: {result['destination']}")
-    st.markdown(result["itinerary_markdown"])
+    _render_save_to_itinerary(
+        session_store, session_id, result, st.session_state.get("result_travel_start_date")
+    )
 
-    score_rows = _extract_scoring_table(result["itinerary_markdown"])
-    if score_rows:
-        st.subheader("Deterministic Score Breakdown")
-        st.dataframe(score_rows, use_container_width=True, hide_index=True)
+    _render_search_result(result)
+
+# --- Itinerary views (opened from the sidebar) ------------------------------------------
+elif st.session_state.stage in _ITINERARY_VIEWS:
+    if st.button("Back"):
+        st.session_state.stage = st.session_state.pop("return_stage", "intake")
+        st.session_state.pop("viewing_itinerary_id", None)
+        st.rerun()
+
+    if st.session_state.stage == "all_itineraries":
+        st.subheader("All itineraries")
+        try:
+            all_itineraries = session_store.list_recent_itineraries(session_id)
+        except Exception as exc:
+            _log_itinerary_failure("list itineraries", exc, session_id=session_id)
+            st.error("Itineraries are unavailable right now.")
+            all_itineraries = []
+        else:
+            if not all_itineraries:
+                st.info("No itineraries yet -- save a search result to start one.")
+        for itinerary in all_itineraries:
+            with st.container(border=True):
+                name_col, open_col = st.columns([4, 1])
+                with name_col:
+                    st.markdown(f"#### {itinerary.name}")
+                    st.caption(
+                        f"{itinerary.run_count} saved search(es) · changed {_hours_ago(itinerary.updated_at)} · "
+                        f"removed automatically in ~{_hours_left(itinerary.expires_at)} h unless changed again."
+                    )
+                with open_col:
+                    if st.button("Open", key=f"all_open_{itinerary.itinerary_id}", use_container_width=True):
+                        _open_itinerary(itinerary.itinerary_id)
+                        st.rerun()
+                saved_runs = _load_itinerary_runs(session_store, session_id, itinerary.itinerary_id)
+                if saved_runs == []:
+                    st.caption("No searches saved to this itinerary yet.")
+                for run in saved_runs or []:
+                    with st.expander(run.label):
+                        _render_stored_run(run)
     else:
-        st.info("Scoring table not available for this run.")
+        itinerary_id = st.session_state.get("viewing_itinerary_id")
+        try:
+            itinerary = session_store.get_itinerary(session_id, itinerary_id) if itinerary_id else None
+        except Exception as exc:
+            _log_itinerary_failure("open itinerary", exc, session_id=session_id, itinerary_id=itinerary_id)
+            st.error("This itinerary is unavailable right now.")
+        else:
+            if itinerary is None:
+                _log_itinerary_failure(
+                    "open itinerary", ItineraryNotFoundError(itinerary_id), session_id=session_id,
+                    itinerary_id=itinerary_id,
+                )
+                st.warning(
+                    "This itinerary is no longer available -- it may have expired after 72 hours without changes."
+                )
+            else:
+                st.subheader(f"Itinerary: {itinerary.name}")
+                st.caption(
+                    f"Last changed {_hours_ago(itinerary.updated_at)} · removed automatically in "
+                    f"~{_hours_left(itinerary.expires_at)} h unless changed again."
+                )
 
-    st.divider()
-    st.caption("Safety grounding")
-    st.write(result["safety_summary"])
-    st.write(f"Primary advisory source: {result['advisory_source_url']}")
+                saved_runs = _load_itinerary_runs(session_store, session_id, itinerary.itinerary_id)
+                if saved_runs == []:
+                    st.info("No searches saved to this itinerary yet.")
+                for run in saved_runs or []:
+                    with st.expander(run.label):
+                        _render_stored_run(run)

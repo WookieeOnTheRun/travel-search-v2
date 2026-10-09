@@ -12,6 +12,7 @@ from ollama import AsyncClient as OllamaAsyncClient
 
 from config import settings
 from .data_sources import gather_grounding_packet
+from .http_utils import describe_error
 from .schemas import DEFAULT_TRIP_LENGTH_DAYS, DestinationCandidate, UserTripRequest
 from .search_agents import HotelSearchAgent, FlightSearchAgent, VisaSearchAgent, AirportSearchAgent
 
@@ -109,7 +110,9 @@ async def _run_specialist(agent: Agent, prompt: str) -> str:
         return str(await agent.run(prompt))
     except Exception as ex:
         logger.exception("Specialist agent %s failed", getattr(agent, "name", agent.__class__.__name__))
-        return f"{getattr(agent, 'name', 'Specialist agent')} unavailable: {ex}"
+        # describe_error, not str(ex): this text reaches the final prompt and the user's screen,
+        # and a raw HTTP error message embeds the full request URL.
+        return f"{getattr(agent, 'name', 'Specialist agent')} unavailable: {describe_error(ex)}"
 
 
 # Main orchestration function that coordinates multiple specialist agents to build a complete trip plan.

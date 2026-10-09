@@ -54,9 +54,11 @@ def _extract_number(pattern: str, text: str) -> float | None:
     return _to_number(match.group(1))
 
 
+# Each amount must start with a digit: a bare "[\d,]+" also matches a lone comma (e.g. "$,"),
+# which then fails float() and aborts discovery for the whole request.
 _BUDGET_PATTERNS = [
-    r"\$\s?([\d,]+(?:\.\d+)?)",
-    r"([\d,]+(?:\.\d+)?)\s*(?:usd|dollars)\b",
+    r"\$\s?(\d[\d,]*(?:\.\d+)?)",
+    r"(\d[\d,]*(?:\.\d+)?)\s*(?:usd|dollars)\b",
 ]
 _TRIP_LENGTH_PATTERN = rf"\b({_NUMBER_PATTERN})[\s-]*day"
 _FLIGHT_HOURS_PATTERN = rf"\b({_NUMBER_PATTERN})[\s-]*hour[s]?\s*flight"
@@ -204,6 +206,11 @@ _FALLBACK_CANDIDATE_NAMES = [
 ]
 
 
+# Matches the "up to 25" the brainstorming prompt asks for. Model output isn't trusted to obey
+# that, and every kept name costs a geocoding call, so the list is hard-capped here.
+_MAX_BRAINSTORMED_NAMES = 25
+
+
 def _parse_name_list(text: str) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
@@ -217,6 +224,8 @@ def _parse_name_list(text: str) -> list[str]:
             continue
         seen.add(key)
         names.append(cleaned)
+        if len(names) >= _MAX_BRAINSTORMED_NAMES:
+            break
     return names
 
 
@@ -243,7 +252,7 @@ async def _brainstorm_candidate_names(constraints: TripConstraints, origin_label
             return names, "brainstormed by the configured travel-idea model, then independently verified"
         logger.warning("Destination idea agent returned no parseable names; using fallback list")
     except Exception as ex:
-        logger.warning("Destination idea agent unavailable, using fallback list: %s", ex)
+        logger.warning("Destination idea agent unavailable, using fallback list: %s", describe_error(ex))
 
     return list(_FALLBACK_CANDIDATE_NAMES), "drawn from a static list of well-known warm/coastal destinations, then independently verified"
 
@@ -259,7 +268,10 @@ _POI_DENSITY_RADIUS_M = 3000
 # testing (2026-09-03) showed that even fully serialized-but-rapid-fire requests from this
 # app tripped its rate limiting; this pacing (used in _attach_beach_and_poi) fixed it.
 _OVERPASS_MIN_INTERVAL_SECONDS = 1.1
-_OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
+# HTTPS, as in the demo server's own documented example query
+# (https://github.com/Project-OSRM/osrm-backend/wiki/Demo-server; verified live 2026-10-09) --
+# plain HTTP would send the traveler's origin/destination coordinates unencrypted.
+_OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 # The public OSRM demo server's usage policy caps this at 1 request/second and forbids
 # heavy/scraped use -- real drive times are only fetched sequentially, with this pacing,
 # and only for the bounded shortlist that survives the cheap distance pre-filter below.

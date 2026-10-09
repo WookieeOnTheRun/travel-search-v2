@@ -1,0 +1,14 @@
+# Beta-deployment hardening. Streamlit reads this file from the directory `streamlit run` is
+# launched from (https://docs.streamlit.io/develop/api-reference/configuration/config.toml).
+# Option values below were checked against `streamlit config show` for the pinned 1.43.2.
+
+[client]
+# Show testers only a generic error message for an uncaught exception; the full traceback
+# (which can include file paths and request details) still prints to the server console.
+showErrorDetails = "none"
+# Hide developer options (rerun/clear cache/settings menu items) from testers.
+toolbarMode = "viewer"
+
+[browser]
+# Don't send Streamlit usage telemetry from this app.
+gatherUsageStats = false
