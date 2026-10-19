@@ -13,6 +13,12 @@ logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
+# Default client timeout: REQUEST_TIMEOUT_SECONDS for the response, but only 5 s to connect. A
+# healthy TLS connect to these APIs takes ~0.1 s, while a dropped attempt (seen intermittently
+# against Open-Meteo, 2026-10-19) otherwise waits the full 20 s before the retry below even
+# starts -- that one stall was 22 s of a 27 s grounding run.
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(settings.request_timeout_seconds, connect=5.0)
+
 # Upper bound on how long a single backoff may sleep. A server-sent Retry-After is honored up
 # to this limit only: the wait happens while holding the per-host lock, so an unbounded value
 # would stall every other request to that host for as long as the server asked.
@@ -37,6 +43,7 @@ _host_locks: dict[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = {}
 _host_locks_guard = threading.Lock()
 
 
+# The lock serializing requests to `url`'s host on the running event loop (created on first use).
 def _host_lock_for(url: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     host = httpx.URL(url).host
@@ -142,6 +149,7 @@ def describe_error(ex: Exception) -> str:
     return f"{type(ex).__name__}: {ex}"
 
 
+# Auth headers RapidAPI requires on every call: the account key and the target product's host.
 def rapidapi_headers(host: str) -> dict[str, str]:
     return {
         "x-rapidapi-key": settings.rapidapi_key,

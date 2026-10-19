@@ -8,49 +8,34 @@ from typing import Any
 import httpx
 
 from config import settings
-from .destination_insights import check_state_department_advisory
-from .http_utils import describe_error, get_with_retry, post_with_retry, rapidapi_headers
+from .destination_insights import check_state_department_advisory, fetch_weather_outlook
+from .http_utils import DEFAULT_HTTP_TIMEOUT, describe_error, get_with_retry, post_with_retry, rapidapi_headers
 from .location_resolution import (
     resolve_booking_hotel_destination,
     resolve_destination_flight_location,
     resolve_origin_flight_location,
 )
-from .schemas import DestinationCandidate, GroundingPacket, LocationCodes
+from .schemas import DestinationCandidate, GroundingPacket, LocationCodes, WeatherOutlook
 from .units import format_temp_c
 
 logger = logging.getLogger(__name__)
 
 
-# Fetches a 5-day weather forecast summary for a specific coordinate pair
-async def _fetch_weather_summary(client: httpx.AsyncClient, latitude: float, longitude: float) -> str:
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-        "forecast_days": 5,
-        "timezone": "auto",
-    }
-
-    response = await get_with_retry(client, url, params=params)
-    data = response.json()
-
-    daily = data.get("daily", {})
-    max_temps = daily.get("temperature_2m_max", [])
-    min_temps = daily.get("temperature_2m_min", [])
-    precipitation = daily.get("precipitation_probability_max", [])
-
-    if not max_temps:
-        return "Weather data unavailable for selected destination."
-
-    avg_high = round(sum(max_temps) / len(max_temps), 1)
-    avg_low = round(sum(min_temps) / len(min_temps), 1)
-    rain_risk = round(sum(precipitation) / len(precipitation), 1) if precipitation else 0
-
-    return (
-        f"5-day outlook: average highs around {format_temp_c(avg_high)}, lows around "
-        f"{format_temp_c(avg_low)}, and average precipitation probability near {rain_risk}%."
+# Weather for the trip's own dates (historical average, plus a live forecast when departure is
+# within 14 days) -- the same outlook the confirm screen shows. Replaces a "5-day outlook" that
+# always covered today onward (verified 2026-10-19: forecast_days=5 returned today..today+4),
+# whatever the trip dates.
+def _summarize_weather(outlook: WeatherOutlook) -> str:
+    if outlook.error:
+        return f"Weather outlook unavailable ({outlook.error})."
+    years_label = ", ".join(str(y) for y in outlook.historical_years_used) or "recent years"
+    summary = (
+        f"Historical average for the trip dates (based on {years_label}): highs around "
+        f"{format_temp_c(outlook.historical_avg_high_c)}, lows around {format_temp_c(outlook.historical_avg_low_c)}."
     )
+    if outlook.is_near_term and outlook.near_term_forecast_summary:
+        summary += f" {outlook.near_term_forecast_summary}"
+    return summary
 
 
 # Retrieves the live U.S. Department of State travel advisory for the destination's country
@@ -89,7 +74,10 @@ async def _fetch_safety_summary(client: httpx.AsyncClient, destination: Destinat
     return summary, level_label, check.link or check.source_url
 
 
-# Gathers generic snippets from a list of configured external travel API endpoints (optional extension point)
+# Optional extension point: GETs each TRAVEL_API_ENDPOINTS URL (with TRAVEL_API_KEY as a Bearer
+# token, if set) passing the request text, destination, currency and locale as query params, and
+# returns the first 900 characters of each JSON response as a grounding snippet. Each endpoint
+# fails independently to an "API unavailable" snippet.
 async def _fetch_external_api_snippets(
     client: httpx.AsyncClient, request_text: str, destination: str
 ) -> list[str]:
@@ -120,10 +108,12 @@ async def _fetch_external_api_snippets(
     return list(await asyncio.gather(*(_fetch_one(endpoint) for endpoint in settings.travel_api_endpoints)))
 
 
+# Stands in for a search that doesn't apply, so it can sit in the same asyncio.gather as real ones.
 async def _skip(message: str) -> str:
     return message
 
 
+# Generic local-transport guidance for the itinerary agents (static text, not fetched data).
 def _build_local_transport_notes(destination_name: str) -> str:
     return (
         f"For {destination_name}, compare premium rental cars for flexibility, airport taxis/Uber for short stays, "
@@ -139,6 +129,9 @@ def _build_local_transport_notes(destination_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Resolves the Booking.com ids needed by the searches: the hotel destination always, and the
+# origin/destination flight location ids only when flights are wanted (and an origin was given).
+# The lookups run concurrently.
 async def resolve_location_codes(
     client: httpx.AsyncClient,
     destination: DestinationCandidate,
@@ -217,6 +210,7 @@ def _format_hotel_price(price_breakdown: dict[str, Any] | None, nights: int) -> 
     return f"{total_label} total for {night_label}"
 
 
+# One-line summary of a searchHotels entry: name, star class, review score, and total price.
 def _format_hotel_result(hotel: dict[str, Any], nights: int) -> str:
     property_ = hotel.get("property") or {}
     name = property_.get("name") or "Unknown property"
@@ -234,6 +228,8 @@ def _format_hotel_result(hotel: dict[str, Any], nights: int) -> str:
     return f"{name} ({star_label}, {review_label}): {price}"
 
 
+# Runs the hotel search described above for the stay and returns a text summary of the top 5
+# properties, or a labeled "unavailable" string on any failure.
 async def _fetch_booking_hotel_results(
     client: httpx.AsyncClient,
     hotel_dest_id: str | None,
@@ -313,6 +309,7 @@ def _format_money(money: dict[str, Any] | None) -> str:
     return f"{amount:,.2f} {currency}".strip()
 
 
+# Flight offers summarized per search (see _select_flight_offers).
 _MAX_FLIGHT_OFFERS = 3
 
 
@@ -357,6 +354,7 @@ def _select_flight_offers(offers: list[dict[str, Any]], *, max_offers: int = _MA
     return [offers[index] for index in sorted(chosen_indices)]
 
 
+# One-line summary of a flight offer: total price, then each segment's route, times, stops and carriers.
 def _format_flight_offer(offer: dict[str, Any]) -> str:
     price = _format_money(offer.get("priceBreakdown", {}).get("total"))
 
@@ -381,6 +379,8 @@ def _format_flight_offer(offer: dict[str, Any]) -> str:
     return f"{price} total: " + " | ".join(leg_summaries)
 
 
+# Runs the flight search described above (round-trip when a return date is given) and returns a
+# text summary of up to _MAX_FLIGHT_OFFERS offers, or a labeled "unavailable" string on failure.
 async def _fetch_booking_flight_results(
     client: httpx.AsyncClient,
     origin_location_id: str | None,
@@ -435,6 +435,9 @@ async def _fetch_booking_flight_results(
     )
 
 
+# Looks up entry requirements for a passport country -> destination country pair
+# (POST /v2/visa/check on RAPIDAPI_VISA_HOST) and returns the first 1200 characters of the
+# response, or a labeled "unavailable" string on failure.
 async def _fetch_visa_requirements(
     client: httpx.AsyncClient, citizenship_country_code: str, destination_country_code: str
 ) -> str:
@@ -458,6 +461,10 @@ async def _fetch_visa_requirements(
         return f"Visa Requirements: unavailable ({describe_error(ex)})"
 
 
+# Collects every real-data input the itinerary agents are grounded on -- weather, the State
+# Department advisory, hotel/flight/visa search results, and any optional external endpoints --
+# into one GroundingPacket. Each source degrades to an "unavailable" note rather than raising.
+# The traveler's citizenship defaults to DEFAULT_CITIZENSHIP_COUNTRY_CODE.
 async def gather_grounding_packet(
     destination: DestinationCandidate,
     *,
@@ -471,65 +478,62 @@ async def gather_grounding_packet(
 ) -> GroundingPacket:
     citizenship = citizenship_country_code or settings.default_citizenship_country_code
 
-    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
-        weather_task = asyncio.create_task(_fetch_weather_summary(client, destination.latitude, destination.longitude))
-        safety_task = (
-            asyncio.create_task(_fetch_safety_summary(client, destination))
-            if destination.country_code
-            else None
-        )
-        codes_task = asyncio.create_task(
-            resolve_location_codes(
-                client,
-                destination,
-                origin_city=origin_city,
-                wants_flights=wants_flights,
-            )
-        )
+    # Weather, the safety advisory and the searches are independent, so all three run at once.
+    # (Previously the searches waited for weather and safety; one stalled weather connection
+    # held the whole packet up -- 22 s of a 27 s grounding run, measured 2026-10-19.)
+    async with httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT) as client:
 
-        weather_summary = "Weather data unavailable."
-        try:
-            weather_summary = await weather_task
-        except Exception as ex:
-            logger.warning("Weather fetch failed for %s: %s", destination.name, describe_error(ex))
-            weather_summary = "Weather feed temporarily unavailable."
-
-        safety_summary = "Advisory feed unavailable. Manually verify current travel advisories at travel.state.gov."
-        advisory_level = "Unknown"
-        advisory_source_url = "https://travel.state.gov/content/travel.html"
-        if safety_task is not None:
+        async def _weather() -> str:
             try:
-                safety_summary, advisory_level, advisory_source_url = await safety_task
+                return _summarize_weather(await fetch_weather_outlook(client, destination, check_in, check_out))
             except Exception as ex:
-                logger.warning("Safety advisory fetch failed for %s: %s", destination.name, describe_error(ex))
+                logger.warning("Weather fetch failed for %s: %s", destination.name, describe_error(ex))
+                return "Weather feed temporarily unavailable."
 
-        codes = await codes_task
-
-        flight_coro = (
-            _fetch_booking_flight_results(
-                client,
-                codes.origin_flight_location_id,
-                codes.destination_flight_location_id,
-                check_in,
-                check_out,
-                traveler_count,
+        async def _safety() -> tuple[str, str, str]:
+            if destination.country_code:
+                try:
+                    return await _fetch_safety_summary(client, destination)
+                except Exception as ex:
+                    logger.warning("Safety advisory fetch failed for %s: %s", destination.name, describe_error(ex))
+            return (
+                "Advisory feed unavailable. Manually verify current travel advisories at travel.state.gov.",
+                "Unknown",
+                "https://travel.state.gov/content/travel.html",
             )
-            if wants_flights
-            else _skip("Booking.com Flights: skipped (no origin city provided, so a route can't be formed).")
-        )
 
-        search_snippets = list(
-            await asyncio.gather(
-                _fetch_booking_hotel_results(
-                    client, codes.hotel_dest_id, codes.hotel_search_type, destination.name, check_in, check_out, traveler_count
-                ),
-                _fetch_visa_requirements(client, citizenship, destination.country_code),
-                flight_coro,
+        async def _searches() -> list[str]:
+            codes = await resolve_location_codes(
+                client, destination, origin_city=origin_city, wants_flights=wants_flights
             )
-        )
+            flight_coro = (
+                _fetch_booking_flight_results(
+                    client,
+                    codes.origin_flight_location_id,
+                    codes.destination_flight_location_id,
+                    check_in,
+                    check_out,
+                    traveler_count,
+                )
+                if wants_flights
+                else _skip("Booking.com Flights: skipped (no origin city provided, so a route can't be formed).")
+            )
+            snippets = list(
+                await asyncio.gather(
+                    _fetch_booking_hotel_results(
+                        client, codes.hotel_dest_id, codes.hotel_search_type, destination.name, check_in, check_out, traveler_count
+                    ),
+                    _fetch_visa_requirements(client, citizenship, destination.country_code),
+                    flight_coro,
+                )
+            )
+            if settings.travel_api_endpoints:
+                snippets.extend(await _fetch_external_api_snippets(client, request_text, destination.name))
+            return snippets
 
-        if settings.travel_api_endpoints:
-            search_snippets.extend(await _fetch_external_api_snippets(client, request_text, destination.name))
+        weather_summary, (safety_summary, advisory_level, advisory_source_url), search_snippets = await asyncio.gather(
+            _weather(), _safety(), _searches()
+        )
 
     return GroundingPacket(
         destination_hint=destination.label,

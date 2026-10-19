@@ -10,3 +10,6 @@ travel_agent/main.env
 
 # Local SQLite session/itinerary store
 data/
+
+# code base for auto-generated test cases
+tests/

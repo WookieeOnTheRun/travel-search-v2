@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
+import httpx
 from datetime import timedelta
 from textwrap import dedent
 from typing import Awaitable, Callable
@@ -14,13 +16,14 @@ from config import settings
 from .data_sources import gather_grounding_packet
 from .http_utils import describe_error
 from .schemas import DEFAULT_TRIP_LENGTH_DAYS, DestinationCandidate, UserTripRequest
-from .search_agents import HotelSearchAgent, FlightSearchAgent, VisaSearchAgent, AirportSearchAgent
 
 logger = logging.getLogger(__name__)
 
+# Receives human-readable progress messages (shown live in the UI's status panel).
 ProgressCallback = Callable[[str], None]
 
 
+# Sends a progress message to the UI's callback, if one was given.
 def _report(on_progress: ProgressCallback | None, message: str) -> None:
     if on_progress is not None:
         on_progress(message)
@@ -52,6 +55,17 @@ async def _gather_with_progress(
 # the Authorization: Bearer <OLLAMA_API_KEY> header Ollama Cloud requires (verified against
 # https://docs.ollama.com/api/authentication) is attached by building the underlying
 # ollama.AsyncClient ourselves and handing it in via the `client=` kwarg.
+#
+# The ollama SDK's own default is no timeout at all (verified: its httpx client reports
+# Timeout(timeout=None)), so a stalled model call would block the user's session forever. The
+# slowest call in a measured end-to-end build (2026-10-19) took 21.7 s; 120 s leaves 5x margin.
+# A timeout surfaces as an exception that every caller already handles (specialist fallback
+# text, discovery's fallback name list, intake's rule-only parse).
+_OLLAMA_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+
+# Raises RuntimeError when OLLAMA_API_KEY is unset, so callers fall back instead of sending
+# unauthenticated requests.
 def build_ollama_client() -> OllamaChatClient:
     if not settings.ollama_api_key:
         raise RuntimeError(
@@ -62,6 +76,7 @@ def build_ollama_client() -> OllamaChatClient:
     ollama_client = OllamaAsyncClient(
         host=settings.ollama_host,
         headers={"Authorization": f"Bearer {settings.ollama_api_key}"},
+        timeout=_OLLAMA_TIMEOUT,
     )
     return OllamaChatClient(client=ollama_client, model=settings.ollama_model)
 
@@ -102,6 +117,32 @@ def _deterministic_ranking_rubric() -> str:
     ).strip()
 
 
+# Shared by the logistics and synthesis agents: every option carries at least one real
+# accommodation from the Booking.com data (never an invented or generic one).
+_ACCOMMODATION_RULE = (
+    "Every option must recommend at least one accommodation taken from the Booking.com Hotels data, "
+    "using the property's exact name, star class, review score, and total stay price exactly as given. "
+    "Match each option's accommodation to that option's budget, and use a different property for each "
+    "option when the data has enough. Never recommend an accommodation that is not in the Booking.com "
+    "Hotels data; if that data is unavailable, say so in each option instead."
+)
+
+
+# Prompt text telling the agents how to treat budget: stay within the stated total, or, with no
+# budget, make the three options low/medium/high budget tiers.
+def _budget_instruction(budget_usd: float | None) -> str:
+    if budget_usd is None:
+        return (
+            "No budget was given. Make the 3 options three budget tiers, in this order: 'Low budget', "
+            "'Medium budget', 'High budget'. Put the tier name in each option's heading, give each a target "
+            "total cost range that rises from tier to tier, and score budget_fit against each option's own tier."
+        )
+    return (
+        f"The traveler's total budget is ${budget_usd:,.0f}. Keep every option within it; if the data makes "
+        "that impossible, say which option exceeds it and by how much."
+    )
+
+
 # Runs a specialist agent and converts a hard failure (LLM endpoint down, timeout,
 # malformed response) into a clearly-labeled fallback string instead of aborting the
 # whole itinerary build. Callers still see that a section degraded.
@@ -115,7 +156,8 @@ async def _run_specialist(agent: Agent, prompt: str) -> str:
         return f"{getattr(agent, 'name', 'Specialist agent')} unavailable: {describe_error(ex)}"
 
 
-# Main orchestration function that coordinates multiple specialist agents to build a complete trip plan.
+# Builds the itinerary options: two specialist calls in parallel (logistics, experiences), then
+# one synthesis call.
 # `destination` must already be a user-confirmed candidate (see travel_agent.location_resolution
 # .geocode_candidates) -- this function resolves real provider codes for it and searches, it does
 # not itself guess which place the user meant.
@@ -147,25 +189,15 @@ async def build_itineraries(
     _report(on_progress, "Grounding data gathered.")
 
     client = build_ollama_client()
+    budget_instruction = _budget_instruction(user_request.budget_usd)
 
-    hotel_agent = HotelSearchAgent(client)
-    flight_agent = FlightSearchAgent(client)
-    visa_agent = VisaSearchAgent(client)
-    airport_agent = AirportSearchAgent(client)
-
-    safety_agent = Agent(
-        name="SafetyAgent",
-        client=client,
-        instructions=dedent(
-            """
-            You are a travel safety specialist.
-            Prioritize traveler safety and legal compliance.
-            Use U.S. Department of State-aligned caution language and avoid recommending risky districts.
-            Output concise safety constraints and risk mitigations.
-            """
-        ).strip(),
-    )
-
+    # Three model calls, not eight. A per-source summary stage (hotel, flight, visa, airport
+    # agents) and a separate safety agent used to run first, but logistics and the synthesizer
+    # already receive the same raw API data and advisory text. An A/B test on identical grounding
+    # (2026-10-19, 3 runs each) gave the same structural results -- scoring table parsed 3/3,
+    # safety/evidence/sources sections, API hotels named, no non-API hotels -- at a mean of
+    # 17.9 s vs 37.7 s. The removed agents' no-invention rules now live in the logistics
+    # instructions below.
     logistics_agent = Agent(
         name="LogisticsAgent",
         client=client,
@@ -179,9 +211,16 @@ async def build_itineraries(
             Prioritize higher-rated options using both source ratings and customer review quality signals
             (review score, review volume, recency, consistency).
             Prefer accommodation options with strong Booking.com Hotels ratings and review confidence.
+            Booking.com Hotels gives each property's star class, review score/count, and the total price
+            for the whole stay; Booking.com Flights gives total price, route, times, stops and carriers.
+            If the API data says a hotel or flight search was skipped or unavailable, say so plainly --
+            never invent hotel names, ratings, prices, flight routes, or airport codes. Use only airport
+            codes that appear in the API data.
             Return practical, bookable-seeming plans with transparent cost ranges and clear tradeoffs.
             """
-        ).strip(),
+        ).strip()
+        + "\n"
+        + _ACCOMMODATION_RULE,
     )
 
     experiences_agent = Agent(
@@ -199,94 +238,10 @@ async def build_itineraries(
         ).strip(),
     )
 
-    # These five specialist calls are mutually independent (each only reads the
-    # shared grounding packet) — run them concurrently rather than paying five
-    # sequential LLM round-trips. _gather_with_progress reports each one to the
-    # status bar as it completes, in whatever order that actually happens.
+    # Independent of each other (both read only the grounding packet), so they run concurrently;
+    # _gather_with_progress reports each to the status bar as it completes.
     specialist_results = await _gather_with_progress(
         {
-            "Hotel search": _run_specialist(
-                hotel_agent,
-                dedent(
-                    f"""
-                    Traveler request: {user_request.request_text}
-                    Destination: {grounding.destination_hint}
-                    API Data: {grounding.external_api_snippets or 'No data'}
-
-                    Hotel Search Requirements:
-                    - Use the accommodation's 'name', 'reviewScore', and 'reviewCount' for the summary.
-                    - Use 'accuratePropertyClass' for the star rating.
-                    - Use 'priceBreakdown.grossPrice' for cost.
-                    - Reference 'photoUrls' entries when present.
-
-                    Find the best hotel/accommodation options.
-                    """
-                ).strip(),
-            ),
-            "Flight search": _run_specialist(
-                flight_agent,
-                dedent(
-                    f"""
-                    Traveler request: {user_request.request_text}
-                    Origin: {user_request.origin_city or 'Not provided'}
-                    Destination: {grounding.destination_hint}
-                    Requested dates: {check_in.isoformat()} to {check_out.isoformat()}
-                    API Data: {grounding.external_api_snippets or 'No data'}
-
-                    {"Flights were not searched because no origin city was provided." if not wants_flights else ""}
-                    Find the best flight options from the Booking.com Flights API data above.
-                    """
-                ).strip(),
-            ),
-            "Visa requirements": _run_specialist(
-                visa_agent,
-                dedent(
-                    f"""
-                    Traveler request: {user_request.request_text}
-                    Destination: {grounding.destination_hint}
-                    Destination country code: {grounding.destination_country_code or 'Unknown'}
-                    API Data: {grounding.external_api_snippets or 'No data'}
-                    Find visa and entry requirements.
-                    """
-                ).strip(),
-            ),
-            "Airport recommendations": _run_specialist(
-                airport_agent,
-                dedent(
-                    f"""
-                    Traveler request: {user_request.request_text}
-                    Destination: {grounding.destination_hint}
-                    API Data: {grounding.external_api_snippets or 'No data'}
-                    Summarize the airports already resolved in the API data above (do not invent codes
-                    that aren't present in that data).
-                    """
-                ).strip(),
-            ),
-        },
-        on_progress,
-    )
-    hotel_search_results = specialist_results["Hotel search"]
-    flight_search_results = specialist_results["Flight search"]
-    visa_search_results = specialist_results["Visa requirements"]
-    airport_search_results = specialist_results["Airport recommendations"]
-
-    # safety_brief and experiences_plan only need the grounding packet; logistics_plan
-    # needs the specialist results above but not the other two. None of the three
-    # depend on each other, so run them concurrently too.
-    synthesis_inputs = await _gather_with_progress(
-        {
-            "Safety brief": _run_specialist(
-                safety_agent,
-                dedent(
-                    f"""
-                    Traveler request: {user_request.request_text}
-                    Destination hint: {grounding.destination_hint}
-                    Safety grounding: {grounding.safety_summary}
-                    Advisory level: {grounding.advisory_level}
-                    Advisory source: {grounding.advisory_source_url}
-                    """
-                ).strip(),
-            ),
             "Logistics plan": _run_specialist(
                 logistics_agent,
                 dedent(
@@ -295,21 +250,10 @@ async def build_itineraries(
                     Origin city: {user_request.origin_city or 'Not provided'}
                     Trip dates: {check_in.isoformat()} to {check_out.isoformat()} ({trip_length_days} days)
                     Number of travelers: {user_request.traveler_count}
+                    Budget: {budget_instruction}
                     Weather grounding: {grounding.weather_summary}
                     Transport grounding: {grounding.local_transport_notes}
                     External API data: {grounding.external_api_snippets or 'No external API snippets provided'}
-
-                    Hotel Search Results:
-                    {hotel_search_results}
-
-                    Flight Search Results:
-                    {flight_search_results}
-
-                    Visa Requirements:
-                    {visa_search_results}
-
-                    Airport Recommendations:
-                    {airport_search_results}
                     """
                 ).strip(),
             ),
@@ -326,9 +270,8 @@ async def build_itineraries(
         },
         on_progress,
     )
-    safety_brief = synthesis_inputs["Safety brief"]
-    logistics_plan = synthesis_inputs["Logistics plan"]
-    experiences_plan = synthesis_inputs["Experience plan"]
+    logistics_plan = specialist_results["Logistics plan"]
+    experiences_plan = specialist_results["Experience plan"]
 
     final_agent = Agent(
         name="ConciergeSynthesizer",
@@ -346,14 +289,16 @@ async def build_itineraries(
             - For hotels and activities, explicitly reference rating confidence based on score + review volume.
             - If an API source is missing/unavailable, state that clearly and continue with available evidence.
             - Include a dedicated safety section with explicit caution areas and behavior recommendations.
-            - Keep luxury feel while honoring budget constraints.
+            - Keep a luxury feel within each option's budget, following the Budget instruction in the user context.
             - Include a section titled 'Deterministic Scoring Table' that shows, for each itinerary:
               rating_quality, review_confidence, safety, budget_fit, final_score, and tie-break explanation.
             - End with two sections:
               1) 'API Evidence Coverage' listing what was used from each provided API
               2) 'Grounding Sources' list containing URLs.
             """
-        ).strip(),
+        ).strip()
+        + "\n- "
+        + _ACCOMMODATION_RULE,
     )
 
     _report(on_progress, "Synthesizing final itinerary options...")
@@ -363,10 +308,9 @@ async def build_itineraries(
             Traveler request:
             {user_request.request_text}
 
-            Inputs from specialist agents:
-            Safety brief:
-            {safety_brief}
+            Budget: {budget_instruction}
 
+            Inputs from specialist agents:
             Logistics plan:
             {logistics_plan}
 

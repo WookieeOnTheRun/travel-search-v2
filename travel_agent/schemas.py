@@ -18,6 +18,9 @@ class UserTripRequest(BaseModel):
     trip_length_days: int | None = None
     traveler_count: int = 1
     travel_start_date: date | None = None
+    # Total budget understood from the request (see request_understanding.py); None = not given,
+    # which makes the itinerary options low/medium/high budget tiers.
+    budget_usd: float | None = None
 
 
 # One candidate destination resolved from the user's free-text prompt via geocoding.
@@ -30,7 +33,12 @@ class DestinationCandidate(BaseModel):
     admin1: str | None = None
     latitude: float
     longitude: float
+    # GeoNames feature code (e.g. "PPLC" = capital, "PCLI" = country) and population, as
+    # returned by the geocoder -- used to judge whether a match is a plausible destination.
+    feature_code: str | None = None
+    population: int | None = None
 
+    # "Name, Region, Country" -- the unambiguous display name.
     @property
     def label(self) -> str:
         region = f", {self.admin1}" if self.admin1 else ""
@@ -101,7 +109,6 @@ class AdvisoryCheck(BaseModel):
 class WeatherOutlook(BaseModel):
     historical_avg_high_c: float | None = None
     historical_avg_low_c: float | None = None
-    historical_avg_precipitation_probability: float | None = None
     historical_years_used: list[int] = Field(default_factory=list)
     is_near_term: bool = False
     near_term_forecast_summary: str | None = None
@@ -117,13 +124,28 @@ class ActivitySuggestion(BaseModel):
     appropriateness_comment: str
     raw_opening_hours: str | None = None
     map_link: str | None = None
+    # Number of Wikipedia/Wikimedia language editions covering the place (Wikidata sitelinks);
+    # None when the place has no Wikidata item or the lookup was unavailable.
+    sitelink_count: int | None = None
+    # Sightseeing interests from the traveler's request that this place matches (e.g. "art").
+    matched_interests: list[str] = Field(default_factory=list)
+    # Plain-language reason it made the list, built only from the signals above.
+    why_listed: str = ""
 
 
+# Sightseeing split two ways: `notable` holds widely documented landmarks, `lesser_known` holds
+# less-documented places that still show a concrete sign of being worth a visit. Both lists are
+# ranked toward `interests` -- sightseeing topics found in the traveler's own request.
 class ActivitySearchResult(BaseModel):
-    activities: list[ActivitySuggestion] = Field(default_factory=list)
+    notable: list[ActivitySuggestion] = Field(default_factory=list)
+    lesser_known: list[ActivitySuggestion] = Field(default_factory=list)
+    interests: list[str] = Field(default_factory=list)
+    # Set when notability couldn't be measured and a coarser signal was used instead.
+    notability_note: str | None = None
     source_note: str = (
-        "Source: OpenStreetMap contributors via the Overpass API -- community-maintained data, "
-        "not an official attractions directory. Confirm current hours/status before visiting."
+        "Source: OpenStreetMap contributors via Geoapify (Powered by Geoapify), with notability from "
+        "Wikidata (number of Wikipedia language editions covering each place) -- community-maintained "
+        "data, not an official attractions directory. Confirm current hours/status before visiting."
     )
     error: str | None = None
 
@@ -148,7 +170,12 @@ class TripConstraints(BaseModel):
     wants_pool_resort: bool = False
     wants_food_scene: bool = False
     wants_entertainment: bool = False
+    wants_hiking: bool = False
+    wants_low_cost: bool = False
     avoid_cultural: bool = False
+    # Month (1-12) named without a specific day, e.g. "a week in March".
+    travel_month: int | None = None
+    traveler_count: int | None = None
 
 
 # One destination proposed during discovery, with every displayed fact independently
@@ -172,6 +199,9 @@ class DiscoveredDestination(BaseModel):
     caveats: list[str] = Field(default_factory=list)
 
 
+# Outcome of one discovery run: the constraints used, the ranked surviving candidates, and
+# counts of how many were considered and why the rest were dropped. `error` is set (and
+# `candidates` empty) when discovery couldn't run at all, e.g. the origin couldn't be geocoded.
 class DestinationDiscoveryResult(BaseModel):
     constraints: TripConstraints
     origin_label: str | None = None
@@ -181,3 +211,18 @@ class DestinationDiscoveryResult(BaseModel):
     candidates_rejected_distance: int = 0
     candidates_rejected_weather: int = 0
     error: str | None = None
+
+
+# Everything understood from a free-text request at intake (see request_understanding.py):
+# rule-based parsing first, then -- only when the rules are unsure -- an LLM extraction whose
+# every value had to be backed by a verbatim quote from the request (and, for destinations, a
+# real geocoding match) before being accepted.
+class ParsedTripRequest(BaseModel):
+    constraints: TripConstraints
+    candidates: list[DestinationCandidate] = Field(default_factory=list)
+    start_date: date | None = None
+    open_ended: bool = False
+    llm_status: str = "not needed"
+    # field name -> "rules" | "llm", for every field that ended up with a value.
+    field_sources: dict[str, str] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)

@@ -21,13 +21,14 @@ from travel_agent import (
     fetch_seasonal_activities,
     fetch_weather_outlook,
     find_nearest_airports,
-    parse_travel_start_date,
-    resolve_destination_candidates,
+    month_window_start,
+    understand_trip_request,
 )
-from travel_agent.destination_discovery import parse_trip_constraints
-from travel_agent.http_utils import describe_error
+from travel_agent.geoapify import ATTRIBUTION as GEOAPIFY_ATTRIBUTION
+from travel_agent.http_utils import DEFAULT_HTTP_TIMEOUT, describe_error
 from travel_agent.persistence import (
     DuplicateItineraryNameError,
+    Itinerary,
     ItineraryNotFoundError,
     MAX_ITINERARY_NAME_LENGTH,
     SearchRun,
@@ -40,12 +41,15 @@ from travel_agent.schemas import (
     ActivitySearchResult,
     AdvisoryCheck,
     DestinationDiscoveryResult,
+    ParsedTripRequest,
+    TripConstraints,
     WeatherOutlook,
 )
 from travel_agent.units import format_temp_c
 
 logger = logging.getLogger(__name__)
 
+# How many nearby airports the confirm screen lists for a destination.
 _NEAREST_AIRPORTS_COUNT = 5
 
 # Input size limits. The request text is sent verbatim to every LLM agent (several prompts per
@@ -60,6 +64,7 @@ _MAX_ORIGIN_CHARS = 100
 # survive refreshes. Anyone holding the full URL can see that session's itineraries -- fine
 # for testing, but don't share the link.
 _SESSION_QUERY_PARAM = "sid"
+# Save-form choice meaning "create a new itinerary with the typed name".
 _NEW_ITINERARY_OPTION = "➕ New itinerary…"
 
 
@@ -130,18 +135,31 @@ def _extract_scoring_table(markdown_text: str) -> list[dict[str, Any]]:
     return records
 
 
-async def _resolve_intake(request_text: str) -> tuple[list[DestinationCandidate], date | None]:
-    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
-        candidates = await resolve_destination_candidates(client, request_text)
-    parsed_date = parse_travel_start_date(request_text)
-    return candidates, parsed_date
+# Parses the intake request into structured trip details and geocoded destination candidates.
+async def _resolve_intake(request_text: str) -> ParsedTripRequest:
+    async with httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT) as client:
+        return await understand_trip_request(client, request_text)
+
+
+# The start date to pre-fill from the request, and how it was derived: an explicit date wins;
+# a month-only mention ("a week in March") falls back to the 1st of that month.
+def _start_date_from_request(parsed: ParsedTripRequest) -> tuple[date | None, str | None]:
+    if parsed.start_date is not None:
+        return parsed.start_date, f"Detected travel start date from your request: {parsed.start_date.isoformat()}"
+    if parsed.constraints.travel_month is not None:
+        start = month_window_start(parsed.constraints.travel_month)
+        return start, (
+            f"Your request names {start.strftime('%B')} but no specific day -- using {start.isoformat()} "
+            "as the start date; change it if you'd like."
+        )
+    return None, None
 
 
 # Used when no specific destination could be named in the request but an origin was given --
 # suggests real, independently-verified candidate destinations instead of a dead-end warning.
 #
 # A short, explicit *connect* timeout matters a lot here specifically: discovery fans out to
-# public, best-effort services (Overpass, OSRM) that can occasionally become slow/unreachable.
+# public, best-effort services (OSRM, Geoapify) that can occasionally become slow/unreachable.
 # A flat 45s timeout (connect+read combined, as a bare `timeout=45.0` sets) turns one bad
 # connection attempt into a 45s stall, repeated across the retry budget and every candidate in
 # the shortlist -- verified live to blow past 20 minutes total. Failing a connection attempt
@@ -150,9 +168,14 @@ async def _resolve_intake(request_text: str) -> tuple[list[DestinationCandidate]
 _DISCOVERY_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 
 
-async def _run_discovery(request_text: str, origin_city: str, start_date: date, end_date: date):
+# Runs destination discovery (see the timeout note above) for a request that named no place.
+async def _run_discovery(
+    request_text: str, origin_city: str, start_date: date, end_date: date, constraints: TripConstraints
+):
     async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT) as client:
-        return await discover_destinations(client, request_text, origin_city, start_date, end_date)
+        return await discover_destinations(
+            client, request_text, origin_city, start_date, end_date, constraints=constraints
+        )
 
 
 # Runs a batch of named coroutines concurrently and calls on_progress(label) as each one
@@ -187,7 +210,7 @@ async def _gather_tracked(jobs: dict[str, Any], on_progress) -> dict[str, Any]:
 #
 # Uses the same short-connect-timeout as _DISCOVERY_TIMEOUT rather than a flat
 # settings.request_timeout_seconds: fetch_seasonal_activities calls the same public
-# Overpass API discovery does, and a flat timeout has the identical multi-minute-hang
+# place-data API discovery does, and a flat timeout has the identical multi-minute-hang
 # failure mode (verified live) when that service is slow/unreachable.
 async def _gather_destination_insights(
     destination: DestinationCandidate,
@@ -195,6 +218,7 @@ async def _gather_destination_insights(
     end_date: date,
     *,
     include_activities: bool,
+    request_text: str = "",
     on_progress=None,
 ) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT) as client:
@@ -204,7 +228,7 @@ async def _gather_destination_insights(
             "airports": find_nearest_airports(client, destination.latitude, destination.longitude, max_results=_NEAREST_AIRPORTS_COUNT),
         }
         if include_activities:
-            jobs["activities"] = fetch_seasonal_activities(client, destination, start_date, end_date)
+            jobs["activities"] = fetch_seasonal_activities(client, destination, start_date, end_date, request_text)
 
         results = await _gather_tracked(jobs, on_progress)
 
@@ -222,25 +246,66 @@ async def _gather_destination_insights(
     }
 
 
+# Session-state keys that outlive a search. Everything else belongs to the in-progress search
+# (request, parsed constraints, candidates, insights, result, widget selections, itinerary-view
+# return state) and is discarded by _reset, so a new search can't inherit any of it -- including
+# keys added later that nobody remembers to list here. Saved itineraries live in the
+# SessionStore, not session state, so they're unaffected.
+_SESSION_KEYS_KEPT_ON_RESET = (
+    "session_id",
+    # Keeps increasing across searches so each new result gets a save form it has never had.
+    "result_seq",
+    "flash",
+)
+
+
+# Starts a brand-new search: drops all context from the previous one.
 def _reset() -> None:
-    for key in (
-        "candidates",
-        "parsed_date",
-        "pending",
-        "result",
-        "insight_key",
-        "insight_advisory",
-        "insight_weather",
-        "insight_activities",
-        "insight_airports",
-        "discovery_result",
-        "discovery_start_date",
-        "discovery_end_date",
-        "result_run_id",
-        "result_travel_start_date",
-    ):
-        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if key not in _SESSION_KEYS_KEPT_ON_RESET:
+            del st.session_state[key]
     st.session_state.stage = "intake"
+
+
+# Starts a new search pre-filled from a saved search, scoped to the itinerary it was saved in:
+# the intake form opens with the saved request's values, and the save form defaults to that
+# itinerary, so a refined result lands back where the original lives. Like "Start over", it
+# first discards whatever search was in progress.
+def _start_refine(itinerary: Itinerary, context: dict[str, Any]) -> None:
+    _reset()
+    st.session_state.refine = {
+        "itinerary_id": itinerary.itinerary_id,
+        "itinerary_name": itinerary.name,
+        "request": context.get("request") or {},
+        "show_activities": bool(context.get("show_activities", False)),
+    }
+
+
+# The saved search's start date, if it's still usable (today or later), for a refined search
+# whose edited request text no longer names a date.
+def _refine_start_date(refine: dict[str, Any] | None) -> date | None:
+    raw = ((refine or {}).get("request") or {}).get("travel_start_date")
+    try:
+        saved = date.fromisoformat(raw) if raw else None
+    except ValueError:
+        return None
+    return saved if saved and saved >= date.today() else None
+
+
+# Shows which trip details were understood from the request and where each came from
+# (deterministic parsing or a quote-verified LLM extraction), plus any parsing notes.
+def _render_request_understanding(parsed: ParsedTripRequest | None) -> None:
+    if parsed is None:
+        return
+    with st.expander("How we read your request", expanded=False):
+        sources = ", ".join(f"{field} ({source})" for field, source in parsed.field_sources.items()) or "nothing"
+        st.write(f"Understood: {sources}.")
+        st.caption(
+            f"AI-assisted parsing: {parsed.llm_status}. Values marked (llm) were only accepted after "
+            "being matched to a verbatim quote from your request (and, for places, a real geocoding match)."
+        )
+        for note in parsed.notes:
+            st.caption(f"- {note}")
 
 
 # Renders the parsed constraints + ranked candidates from a destination-discovery run
@@ -255,12 +320,14 @@ def _render_discovery_result(result: DestinationDiscoveryResult) -> None:
             "not used to filter suggestions below) | "
             f"Trip length: {f'{c.trip_length_days} days' if c.trip_length_days is not None else 'not specified'} | "
             f"Max flight time: {f'{c.max_flight_hours:g}h' if c.max_flight_hours is not None else 'not specified'} | "
-            f"Max drive time: {f'{c.max_drive_hours:g}h' if c.max_drive_hours is not None else 'not specified'}"
+            f"Max drive time: {f'{c.max_drive_hours:g}h' if c.max_drive_hours is not None else 'not specified'} | "
+            f"Travel month: {date(2000, c.travel_month, 1).strftime('%B') if c.travel_month else 'not specified'}"
         )
         st.write(
             f"Wants warm weather: {c.wants_warm} | Wants beach: {c.wants_beach} | "
             f"Wants pool/resort: {c.wants_pool_resort} | Wants food scene: {c.wants_food_scene} | "
-            f"Wants entertainment/nightlife: {c.wants_entertainment} | "
+            f"Wants entertainment/nightlife: {c.wants_entertainment} | Wants hiking: {c.wants_hiking} | "
+            f"Wants low cost: {c.wants_low_cost} (not verified against prices at this stage) | "
             f"Wants to skip cultural/sightseeing: {c.avoid_cultural}"
         )
         st.caption(
@@ -297,10 +364,13 @@ def _render_discovery_result(result: DestinationDiscoveryResult) -> None:
         st.write(f"- {reason}")
     for caveat in selected.caveats:
         st.caption(f"Note: {caveat}")
+    # Required by Geoapify's free plan wherever its place data is shown.
+    st.caption(GEOAPIFY_ATTRIBUTION)
 
     if st.button("Continue with this destination", type="primary"):
         st.session_state.candidates = [selected.destination]
-        st.session_state.parsed_date = None
+        # Carry the discovery window's start (e.g. the month the traveler named) into confirm.
+        st.session_state.parsed_date = st.session_state.get("discovery_start_date")
         st.session_state.stage = "confirm"
         st.rerun()
 
@@ -380,26 +450,43 @@ def _render_destination_insights(
         st.caption("Sightseeing & points of interest are hidden -- enable the checkbox on the search page to show them.")
     elif activities.error:
         st.caption(f"Activity/sightseeing search unavailable ({activities.error}).")
-    elif activities.activities:
+    elif activities.notable or activities.lesser_known:
         st.write("Nearby activities & sightseeing (auto-checked against your travel dates):")
-        st.dataframe(
-            [
-                {
-                    "Name": a.name,
-                    "Category": a.category,
-                    "Appropriate for your dates?": a.appropriateness_comment,
-                    "Listed hours": a.raw_opening_hours or "Not listed",
-                }
-                for a in activities.activities
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+        if activities.interests:
+            st.caption(f"Ranked toward the interests in your request: {', '.join(activities.interests)}.")
+        else:
+            st.caption("No specific sightseeing interests found in your request -- ranked by notability and distance.")
+        for heading, suggestions, empty_note in (
+            ("Most notable", activities.notable, "No widely documented landmarks were found near this destination."),
+            ("Lesser-known, worth considering", activities.lesser_known, "No further documented places were found nearby."),
+        ):
+            st.markdown(f"**{heading}**")
+            if suggestions:
+                st.dataframe(
+                    [
+                        {
+                            "Name": a.name,
+                            "Category": a.category,
+                            "Why it's listed": a.why_listed,
+                            "Appropriate for your dates?": a.appropriateness_comment,
+                            "Listed hours": a.raw_opening_hours or "Not listed",
+                        }
+                        for a in suggestions
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption(empty_note)
+        if activities.notability_note:
+            st.caption(activities.notability_note)
         st.caption(activities.source_note)
     else:
         st.caption("No named attractions were found nearby in OpenStreetMap data for this destination.")
 
 
+# One SessionStore per server process, shared by every browser session (each call opens its
+# own SQLite connection, so sharing is safe).
 @st.cache_resource
 def _get_session_store() -> SessionStore:
     return SessionStore(settings.session_db_path)
@@ -430,12 +517,14 @@ def _flash(message: str) -> None:
     st.session_state.flash = message
 
 
+# Displays and clears the message queued by _flash, if any.
 def _show_flash() -> None:
     message = st.session_state.pop("flash", None)
     if message:
         st.success(message)
 
 
+# "N min ago" / "N h ago" label for a past UTC timestamp.
 def _hours_ago(moment: datetime) -> str:
     hours = (datetime.now(timezone.utc) - moment).total_seconds() / 3600
     if hours < 1:
@@ -443,6 +532,7 @@ def _hours_ago(moment: datetime) -> str:
     return f"{int(hours)} h ago"
 
 
+# Whole hours until a future UTC timestamp (0 once it has passed).
 def _hours_left(moment: datetime) -> int:
     return max(int((moment - datetime.now(timezone.utc)).total_seconds() // 3600), 0)
 
@@ -462,6 +552,7 @@ def _log_itinerary_failure(action: str, exc: Exception, **ids: str | None) -> No
     )
 
 
+# Stages that show saved itineraries rather than a step of the search flow.
 _ITINERARY_VIEWS = ("itinerary", "all_itineraries")
 
 
@@ -473,11 +564,14 @@ def _open_view(stage: str) -> None:
     st.session_state.stage = stage
 
 
+# Opens the single-itinerary view for `itinerary_id`.
 def _open_itinerary(itinerary_id: str) -> None:
     st.session_state.viewing_itinerary_id = itinerary_id
     _open_view("itinerary")
 
 
+# Sidebar listing this session's live itineraries (newest change first), a link to the
+# all-itineraries view, and a form to create an empty itinerary.
 def _render_itinerary_sidebar(store: SessionStore, session_id: str) -> None:
     with st.sidebar:
         st.header("Itineraries")
@@ -537,7 +631,11 @@ def _render_itinerary_sidebar(store: SessionStore, session_id: str) -> None:
 # one. Nothing is stored until this form is submitted; the first save stores the result and
 # later saves file that same stored run into further itineraries.
 def _render_save_to_itinerary(
-    store: SessionStore, session_id: str, result: dict[str, Any], travel_start_date: date | None
+    store: SessionStore,
+    session_id: str,
+    result: dict[str, Any],
+    travel_start_date: date | None,
+    context: dict[str, Any] | None,
 ) -> None:
     try:
         itineraries = store.list_recent_itineraries(session_id)
@@ -552,11 +650,15 @@ def _render_save_to_itinerary(
     # Keyed by a per-search counter (bumped each time a new result is generated) so every new
     # search gets a fresh form instead of inheriting the previous one's widget state.
     form_key = f"save_result_{st.session_state.get('result_seq', 0)}"
+    options = [_NEW_ITINERARY_OPTION] + [i.name for i in itineraries]
+    # A refined search defaults to the itinerary it came from (if that itinerary still exists).
+    refine_id = (st.session_state.get("refine") or {}).get("itinerary_id")
+    default_index = next(
+        (index + 1 for index, i in enumerate(itineraries) if i.itinerary_id == refine_id), 0
+    )
     with st.form(form_key, clear_on_submit=True):
         st.markdown("**Save this search to an itinerary**")
-        choice = st.selectbox(
-            "Itinerary", [_NEW_ITINERARY_OPTION] + [i.name for i in itineraries], key=f"{form_key}_choice"
-        )
+        choice = st.selectbox("Itinerary", options, index=default_index, key=f"{form_key}_choice")
         new_name = st.text_input(
             "New itinerary name (used when \"New itinerary\" is selected)",
             max_chars=MAX_ITINERARY_NAME_LENGTH,
@@ -582,7 +684,7 @@ def _render_save_to_itinerary(
             itinerary_id, target_name = target.itinerary_id, target.name
         if run_id is None:
             st.session_state.result_run_id = store.save_search_to_itinerary(
-                session_id, itinerary_id, result, travel_start_date
+                session_id, itinerary_id, result, travel_start_date, context
             )
         else:
             store.add_run_to_itinerary(session_id, itinerary_id, run_id)
@@ -600,6 +702,8 @@ def _render_save_to_itinerary(
         st.rerun()
 
 
+# Renders one generated result (the dict build_itineraries returns): the itinerary markdown,
+# its scoring table, and the safety summary it was grounded on.
 def _render_search_result(result: dict[str, Any]) -> None:
     st.subheader(f"Destination focus: {result['destination']}")
     st.markdown(result["itinerary_markdown"])
@@ -617,12 +721,42 @@ def _render_search_result(result: dict[str, Any]) -> None:
     st.write(f"Primary advisory source: {result['advisory_source_url']}")
 
 
-def _render_stored_run(run: SearchRun) -> None:
+# Shows the search a saved run came from, so it can be reviewed or refined later.
+def _render_search_context(context: dict[str, Any]) -> None:
+    request = context.get("request") or {}
+    if not request:
+        return
+    days = request.get("trip_length_days")
+    budget = request.get("budget_usd")
+    details = [
+        f"From: {request.get('origin_city') or 'not specified'}",
+        f"Trip length: {f'{days} days' if days else 'not specified'}",
+        f"Travelers: {request.get('traveler_count', 1)}",
+        f"Budget: {f'${budget:,.0f}' if budget is not None else 'not specified'}",
+    ]
+    st.markdown("**Search details**")
+    # Free-form user input (request text, origin): shown as plain text, never rendered as Markdown.
+    st.text(" · ".join(details))
+    st.text(request.get("request_text", ""))
+
+
+# Renders one saved search inside an itinerary view. Searches saved with their context get a
+# "Refine this search" button that reopens the request for editing, scoped to `itinerary`.
+def _render_stored_run(run: SearchRun, itinerary: Itinerary) -> None:
     st.caption(
         f"Searched {_hours_ago(run.created_at)}. Prices and availability are a snapshot from that "
         "time, not live quotes."
     )
+    # Outside the try below: st.rerun() works by raising, which that handler must not swallow.
+    if run.context.get("request") and st.button(
+        "Refine this search",
+        key=f"refine_{itinerary.itinerary_id}_{run.run_id}",
+        help=f'Start a new search from this one; its result can be saved back to "{itinerary.name}".',
+    ):
+        _start_refine(itinerary, run.context)
+        st.rerun()
     try:
+        _render_search_context(run.context)
         _render_search_result(run.result)
     except Exception as exc:
         _log_itinerary_failure("render saved search", exc, run_id=run.run_id)
@@ -650,6 +784,9 @@ st.write(
     "luxury-within-budget itinerary options with safety-aware guidance."
 )
 
+# Which screen to show: "intake" -> ("discover") -> "confirm" -> "results", or one of the
+# _ITINERARY_VIEWS. Each Streamlit rerun executes this script top to bottom and renders the
+# branch for the current stage.
 if "stage" not in st.session_state:
     st.session_state.stage = "intake"
 
@@ -660,9 +797,22 @@ _show_flash()
 
 # --- Stage 1: free-text intake -----------------------------------------------------
 if st.session_state.stage == "intake":
+    # Set by "Refine this search": pre-fills the form below from the saved search.
+    refine = st.session_state.get("refine")
+    prefill = (refine or {}).get("request") or {}
+    if refine:
+        st.info(
+            f'Refining a saved search from itinerary "{refine["itinerary_name"]}". Edit the request '
+            "below; the new result can be saved back to that itinerary."
+        )
+        if st.button("Cancel refining"):
+            _reset()
+            st.rerun()
+
     with st.form("trip_form"):
         request_text = st.text_area(
             "Travel request",
+            value=prefill.get("request_text") or "",
             height=180,
             max_chars=_MAX_REQUEST_CHARS,
             placeholder=(
@@ -676,16 +826,24 @@ if st.session_state.stage == "intake":
             origin_city = st.text_input(
                 "Origin city (optional for flight search; required if you want us to suggest "
                 "destinations instead of naming one)",
+                value=prefill.get("origin_city") or "",
                 max_chars=_MAX_ORIGIN_CHARS,
             )
+        # Saved values are clamped to the inputs' ranges, which a widget's initial value must respect.
         with col2:
-            trip_length_days = st.number_input("Trip length (days, optional)", min_value=0, max_value=60, value=0)
+            trip_length_days = st.number_input(
+                "Trip length (days, optional)", min_value=0, max_value=60,
+                value=min(max(int(prefill.get("trip_length_days") or 0), 0), 60),
+            )
         with col3:
-            traveler_count = st.number_input("Number of travelers", min_value=1, max_value=20, value=1)
+            traveler_count = st.number_input(
+                "Number of travelers", min_value=1, max_value=20,
+                value=min(max(int(prefill.get("traveler_count") or 1), 1), 20),
+            )
 
         show_activities = st.checkbox(
             "Show sightseeing opportunities & places of interest",
-            value=False,
+            value=bool((refine or {}).get("show_activities", False)),
             help=(
                 "When checked, the confirm screen will search OpenStreetMap for nearby "
                 "attractions/points of interest and display them. Off by default."
@@ -705,20 +863,38 @@ if st.session_state.stage == "intake":
         else:
             candidates: list[DestinationCandidate] = []
             parsed_date: date | None = None
+            parsed_date_note: str | None = None
+            parsed: ParsedTripRequest | None = None
             resolution_failed = False
             with st.status("Identifying destination options...", expanded=True) as status:
                 try:
-                    candidates, parsed_date = asyncio.run(_resolve_intake(request_text.strip()))
-                    status.update(
-                        label=f"Found {len(candidates)} destination option(s)" if candidates else "No destination found in request text",
-                        state="complete",
-                    )
+                    parsed = asyncio.run(_resolve_intake(request_text.strip()))
+                    candidates = parsed.candidates
+                    parsed_date, parsed_date_note = _start_date_from_request(parsed)
+                    if parsed_date is None and (saved_start := _refine_start_date(refine)):
+                        parsed_date = saved_start
+                        parsed_date_note = f"Using the start date from the saved search: {saved_start.isoformat()}"
+                    if candidates:
+                        label = f"Found {len(candidates)} destination option(s)"
+                    elif parsed.open_ended:
+                        label = "No specific destination requested -- we'll suggest some"
+                    else:
+                        label = "No destination found in request text"
+                    status.update(label=label, state="complete")
                 except Exception:
                     logger.exception(
                         "Destination resolution failed (request length=%d chars)", len(request_text)
                     )
                     status.update(label="Destination lookup failed", state="error")
                     resolution_failed = True
+
+            if parsed is not None:
+                # Values stated in the text fill form fields left at their defaults (0 days / 1 traveler).
+                trip_length_days = trip_length_days or parsed.constraints.trip_length_days or 0
+                if traveler_count == 1 and parsed.constraints.traveler_count:
+                    traveler_count = parsed.constraints.traveler_count
+                st.session_state.parsed_request = parsed
+                st.session_state.parsed_date_note = parsed_date_note
 
             if resolution_failed:
                 st.error(
@@ -734,12 +910,9 @@ if st.session_state.stage == "intake":
             elif not candidates:
                 # No place was named, but we have a departure point -- try to suggest destinations
                 # that match the described vibe/constraints instead of a dead end.
-                text_constraints = parse_trip_constraints(request_text.strip())
-                trip_length_days = (
-                    trip_length_days if trip_length_days > 0
-                    else text_constraints.trip_length_days or DEFAULT_TRIP_LENGTH_DAYS
-                )
+                trip_length_days = trip_length_days or DEFAULT_TRIP_LENGTH_DAYS
                 discovery_start = parsed_date or date.today()
+                st.session_state.discovery_start_date = parsed_date
                 discovery_end = discovery_start + timedelta(days=trip_length_days)
 
                 discovery_result = None
@@ -752,7 +925,10 @@ if st.session_state.stage == "intake":
                 ) as status:
                     try:
                         discovery_result = asyncio.run(
-                            _run_discovery(request_text.strip(), origin_city.strip(), discovery_start, discovery_end)
+                            _run_discovery(
+                                request_text.strip(), origin_city.strip(), discovery_start, discovery_end,
+                                parsed.constraints,
+                            )
                         )
                         status.update(label="Destination search complete", state="complete")
                     except Exception:
@@ -777,6 +953,7 @@ if st.session_state.stage == "intake":
                         "origin_city": origin_city.strip() or None,
                         "trip_length_days": trip_length_days,
                         "traveler_count": traveler_count,
+                        "budget_usd": parsed.constraints.budget_usd,
                         "show_activities": show_activities,
                     }
                     st.rerun()
@@ -789,6 +966,7 @@ if st.session_state.stage == "intake":
                     "origin_city": origin_city.strip() or None,
                     "trip_length_days": trip_length_days if trip_length_days > 0 else None,
                     "traveler_count": traveler_count,
+                    "budget_usd": parsed.constraints.budget_usd,
                     "show_activities": show_activities,
                 }
                 st.rerun()
@@ -801,6 +979,7 @@ elif st.session_state.stage == "discover":
         "every fact shown below (distance, weather, beach/POI presence) comes from a live, independent check, "
         "not a guess."
     )
+    _render_request_understanding(st.session_state.get("parsed_request"))
     _render_discovery_result(st.session_state.discovery_result)
 
     if st.button("Back"):
@@ -816,10 +995,14 @@ elif st.session_state.stage == "confirm":
     st.caption("Picked from your request -- confirm one before we search flights and hotels for it.")
     selected_label = st.radio("Destination", [c.label for c in candidates], index=0, label_visibility="collapsed")
     selected_destination = next(c for c in candidates if c.label == selected_label)
+    _render_request_understanding(st.session_state.get("parsed_request"))
 
     st.subheader("When are you traveling?")
     if parsed_date is not None:
-        st.caption(f"Detected travel start date from your request: {parsed_date.isoformat()}")
+        st.caption(
+            st.session_state.get("parsed_date_note")
+            or f"Detected travel start date from your request: {parsed_date.isoformat()}"
+        )
         use_detected_date = st.checkbox("Use this date", value=True)
         travel_start_date = parsed_date if use_detected_date else st.date_input(
             "Travel start date", min_value=date.today()
@@ -852,6 +1035,7 @@ elif st.session_state.stage == "confirm":
                         travel_start_date,
                         insight_end_date,
                         include_activities=show_activities,
+                        request_text=st.session_state.pending.get("request_text", ""),
                         on_progress=_on_insight_progress,
                     )
                 )
@@ -895,6 +1079,7 @@ elif st.session_state.stage == "confirm":
             origin_city=pending["origin_city"],
             trip_length_days=pending["trip_length_days"],
             traveler_count=pending["traveler_count"],
+            budget_usd=pending.get("budget_usd"),
             travel_start_date=travel_start_date,
         )
         result = None
@@ -926,6 +1111,13 @@ elif st.session_state.stage == "confirm":
             st.session_state.result_seq = st.session_state.get("result_seq", 0) + 1
             st.session_state.result_travel_start_date = travel_start_date
             st.session_state.result = result
+            # Snapshot of the search behind this result, saved alongside it if the user files it
+            # into an itinerary -- the live search state is discarded on "Start over".
+            st.session_state.result_context = {
+                "request": request.model_dump(mode="json"),
+                "destination": selected_destination.model_dump(mode="json"),
+                "show_activities": show_activities,
+            }
             st.session_state.stage = "results"
             st.rerun()
 
@@ -937,8 +1129,14 @@ elif st.session_state.stage == "results":
         _reset()
         st.rerun()
 
+    if refine := st.session_state.get("refine"):
+        st.caption(f'Refined from a search in itinerary "{refine["itinerary_name"]}".')
     _render_save_to_itinerary(
-        session_store, session_id, result, st.session_state.get("result_travel_start_date")
+        session_store,
+        session_id,
+        result,
+        st.session_state.get("result_travel_start_date"),
+        st.session_state.get("result_context"),
     )
 
     _render_search_result(result)
@@ -979,7 +1177,7 @@ elif st.session_state.stage in _ITINERARY_VIEWS:
                     st.caption("No searches saved to this itinerary yet.")
                 for run in saved_runs or []:
                     with st.expander(run.label):
-                        _render_stored_run(run)
+                        _render_stored_run(run, itinerary)
     else:
         itinerary_id = st.session_state.get("viewing_itinerary_id")
         try:
@@ -1008,4 +1206,4 @@ elif st.session_state.stage in _ITINERARY_VIEWS:
                     st.info("No searches saved to this itinerary yet.")
                 for run in saved_runs or []:
                     with st.expander(run.label):
-                        _render_stored_run(run)
+                        _render_stored_run(run, itinerary)

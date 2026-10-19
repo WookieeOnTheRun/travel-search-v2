@@ -17,6 +17,7 @@ from pydantic import BaseModel
 # space, so correctness never depends on when (or whether) a purge last ran.
 ITINERARY_RETENTION = timedelta(hours=72)
 
+# Longest itinerary name accepted (after whitespace is collapsed).
 MAX_ITINERARY_NAME_LENGTH = 80
 
 # Characters an itinerary name may contain: letters/digits in any script, spaces, and common
@@ -26,6 +27,9 @@ MAX_ITINERARY_NAME_LENGTH = 80
 # '#', '*', '!' or '|'. Validating once at creation covers every place a name is displayed.
 _ITINERARY_NAME_PATTERN = re.compile(r"[\w \-.,'&()/:?+]+")
 
+# Tables: sessions (one anonymous browser session each), search_runs (stored results plus their
+# search context), itineraries (user-named collections), and itinerary_items (which runs are in
+# which itineraries -- a run can be filed in several).
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id   TEXT PRIMARY KEY,
@@ -39,7 +43,8 @@ CREATE TABLE IF NOT EXISTS search_runs (
     created_at        TEXT NOT NULL,
     destination       TEXT NOT NULL,
     travel_start_date TEXT,
-    result_json       TEXT NOT NULL
+    result_json       TEXT NOT NULL,
+    context_json      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_search_runs_session ON search_runs(session_id, created_at);
 
@@ -62,28 +67,36 @@ CREATE TABLE IF NOT EXISTS itinerary_items (
 """
 
 
+# The session already has an itinerary with that name (names are unique, case-insensitively).
 class DuplicateItineraryNameError(ValueError):
     pass
 
 
+# The itinerary doesn't exist, belongs to another session, or has expired.
 class ItineraryNotFoundError(LookupError):
     pass
 
 
+# The search run doesn't exist or belongs to another session.
 class SearchRunNotFoundError(LookupError):
     pass
 
 
 # One completed itinerary-generation run that was saved to an itinerary, stored whole (the dict build_itineraries returns)
 # so it can be re-rendered exactly as it was shown. Prices inside it are a snapshot as of
-# `created_at`, not live quotes.
+# `created_at`, not live quotes. `context` is the search that produced it (request text,
+# origin, trip length, travelers, budget, confirmed destination), so the run can be revisited
+# or refined later without depending on the live search, which "Start over" discards. Runs
+# saved before context was recorded have an empty `context`.
 class SearchRun(BaseModel):
     run_id: str
     created_at: datetime
     destination: str
     travel_start_date: date | None = None
     result: dict[str, Any]
+    context: dict[str, Any] = {}
 
+    # "Destination (start date)" -- the run's heading in itinerary views.
     @property
     def label(self) -> str:
         when = f" ({self.travel_start_date.isoformat()})" if self.travel_start_date else ""
@@ -99,11 +112,13 @@ class Itinerary(BaseModel):
     updated_at: datetime
     run_count: int = 0
 
+    # When the itinerary disappears unless it changes again first.
     @property
     def expires_at(self) -> datetime:
         return self.updated_at + ITINERARY_RETENTION
 
 
+# Current time as an aware UTC datetime.
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -114,6 +129,8 @@ def _ts(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+# Whether `value` is a canonical UUID4 string -- the only session-id form the app mints, so
+# anything else arriving in the URL is replaced rather than trusted.
 def is_valid_session_id(value: str | None) -> bool:
     if not value:
         return False
@@ -123,6 +140,7 @@ def is_valid_session_id(value: str | None) -> bool:
         return False
 
 
+# A fresh random (UUID4) session id.
 def new_session_id() -> str:
     return str(uuid.uuid4())
 
@@ -135,6 +153,7 @@ def new_session_id() -> str:
 # browser session's script on its own thread and reruns it on every interaction, and a
 # per-call connection sidesteps sqlite3's same-thread restriction without any locking.
 class SessionStore:
+    # Opens (creating if needed) the database at `db_path` and brings its schema up to date.
     def __init__(self, db_path: str | Path):
         self._db_path = str(db_path)
         if self._db_path != ":memory:":
@@ -142,7 +161,18 @@ class SessionStore:
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
 
+    # Brings databases created before a column existed up to date. CREATE TABLE IF NOT EXISTS
+    # leaves an existing table untouched, so added columns need an explicit ALTER.
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(search_runs)")}
+        if "context_json" not in columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN context_json TEXT")
+
+    # A connection with foreign keys on, wrapped in one transaction (committed on success,
+    # rolled back on error) and closed afterwards.
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._db_path, timeout=10)
@@ -154,6 +184,7 @@ class SessionStore:
         finally:
             conn.close()
 
+    # Records that the session was seen now (creating its row if needed).
     def touch_session(self, session_id: str, now: datetime | None = None) -> None:
         with self._connect() as conn:
             self._touch(conn, session_id, _ts(now or _utcnow()))
@@ -200,6 +231,7 @@ class SessionStore:
         itinerary_id: str,
         result: dict[str, Any],
         travel_start_date: date | None,
+        context: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> str:
         now = now or _utcnow()
@@ -211,8 +243,8 @@ class SessionStore:
             self._touch(conn, session_id, stamp)
             conn.execute(
                 "INSERT INTO search_runs "
-                "(run_id, session_id, created_at, destination, travel_start_date, result_json) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(run_id, session_id, created_at, destination, travel_start_date, result_json, context_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     session_id,
@@ -220,6 +252,7 @@ class SessionStore:
                     str(result.get("destination", "Unknown destination")),
                     travel_start_date.isoformat() if travel_start_date else None,
                     json.dumps(result),
+                    json.dumps(context) if context else None,
                 ),
             )
             conn.execute(
@@ -231,6 +264,9 @@ class SessionStore:
             )
         return run_id
 
+    # Creates an empty itinerary after validating its name (whitespace collapsed, length and
+    # allowed characters checked) and returns its id. Raises ValueError for an invalid name and
+    # DuplicateItineraryNameError if the session already uses it.
     def create_itinerary(self, session_id: str, name: str, now: datetime | None = None) -> str:
         clean_name = " ".join(name.split())
         if not clean_name:
@@ -283,6 +319,7 @@ class SessionStore:
                 "UPDATE itineraries SET updated_at = ? WHERE itinerary_id = ?", (stamp, itinerary_id)
             )
 
+    # The session's live (unexpired) itineraries with their run counts, most recently changed first.
     def list_recent_itineraries(self, session_id: str, now: datetime | None = None) -> list[Itinerary]:
         cutoff = _ts((now or _utcnow()) - ITINERARY_RETENTION)
         with self._connect() as conn:
@@ -296,6 +333,7 @@ class SessionStore:
             ).fetchall()
         return [Itinerary(**dict(row)) for row in rows]
 
+    # One live itinerary of this session, or None if it doesn't exist or has expired.
     def get_itinerary(
         self, session_id: str, itinerary_id: str, now: datetime | None = None
     ) -> Itinerary | None:
@@ -304,6 +342,7 @@ class SessionStore:
             None,
         )
 
+    # The runs saved in a live itinerary, most recently added first ([] if it isn't live).
     def list_itinerary_runs(
         self, session_id: str, itinerary_id: str, now: datetime | None = None
     ) -> list[SearchRun]:
@@ -319,6 +358,7 @@ class SessionStore:
             ).fetchall()
         return [self._row_to_run(row) for row in rows]
 
+    # Whether the itinerary exists, belongs to this session, and hasn't expired.
     @staticmethod
     def _itinerary_is_live(
         conn: sqlite3.Connection, session_id: str, itinerary_id: str, now: datetime
@@ -329,6 +369,7 @@ class SessionStore:
         ).fetchone()
         return row is not None
 
+    # Builds a SearchRun from a search_runs row, decoding its JSON columns.
     @staticmethod
     def _row_to_run(row: sqlite3.Row) -> SearchRun:
         return SearchRun(
@@ -337,4 +378,5 @@ class SessionStore:
             destination=row["destination"],
             travel_start_date=row["travel_start_date"],
             result=json.loads(row["result_json"]),
+            context=json.loads(row["context_json"]) if row["context_json"] else {},
         )

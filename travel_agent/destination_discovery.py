@@ -11,9 +11,10 @@ from agent_framework import Agent
 
 from .destination_insights import fetch_weather_outlook
 from .geo import haversine_km
-from .http_utils import describe_error, get_with_retry, post_with_retry
+from .http_utils import describe_error, get_with_retry
 from .itinerary_agent import build_ollama_client
-from .location_resolution import geocode_candidates
+from .geoapify import search_places
+from .location_resolution import geocode_candidates, parse_travel_month
 from .schemas import (
     DestinationCandidate,
     DestinationDiscoveryResult,
@@ -40,6 +41,7 @@ _NUMBER_WORDS = {
 _NUMBER_PATTERN = r"(?:\d+(?:\.\d+)?|" + "|".join(_NUMBER_WORDS) + r")"
 
 
+# Converts a digit string or a number word ("three") to a float.
 def _to_number(token: str) -> float:
     token = token.lower()
     if token in _NUMBER_WORDS:
@@ -47,6 +49,7 @@ def _to_number(token: str) -> float:
     return float(token)
 
 
+# The number captured by `pattern`'s first group, or None if the pattern doesn't match.
 def _extract_number(pattern: str, text: str) -> float | None:
     match = re.search(pattern, text, re.IGNORECASE)
     if not match:
@@ -56,18 +59,42 @@ def _extract_number(pattern: str, text: str) -> float | None:
 
 # Each amount must start with a digit: a bare "[\d,]+" also matches a lone comma (e.g. "$,"),
 # which then fails float() and aborts discovery for the whole request.
+# An optional "k" suffix multiplies by 1,000 ("$3k").
 _BUDGET_PATTERNS = [
-    r"\$\s?(\d[\d,]*(?:\.\d+)?)",
-    r"(\d[\d,]*(?:\.\d+)?)\s*(?:usd|dollars)\b",
+    r"\$\s?(\d[\d,]*(?:\.\d+)?)\s?(k)?\b",
+    r"(\d[\d,]*(?:\.\d+)?)\s?(k)?\s*(?:usd|dollars)\b",
 ]
-_TRIP_LENGTH_PATTERN = rf"\b({_NUMBER_PATTERN})[\s-]*day"
+# Trip length is used as the check-out offset from the start date, so "5 nights" and "5 days"
+# both mean 5. Tried in order; the first match wins.
+_TRIP_LENGTH_PATTERNS = [
+    (rf"\b({_NUMBER_PATTERN})[\s-]*(?:day|night)s?\b", 1),
+    (rf"\b({_NUMBER_PATTERN})[\s-]*weeks?\b", 7),
+    (r"\b(a)\s+fortnight\b", 14),
+    # "a week", "beach week" -- but not "next week"/"per week", which are dates/rates.
+    (r"(?<!\bnext )(?<!\bthis )(?<!\blast )(?<!\bper )(?<!\beach )\b(week)\b", 7),
+    (r"\b(weekend)\b", 2),
+]
+_TRAVELER_PATTERNS = [
+    rf"\b({_NUMBER_PATTERN})\s+(?:travell?ers?|people|persons|adults|guests|pax)\b",
+    rf"\bfamily\s+of\s+({_NUMBER_PATTERN})\b",
+]
+_SOLO_PATTERN = re.compile(r"\bsolo\b|\bjust\s+me\b|\bby\s+myself\b|\btravell?ing\s+alone\b", re.IGNORECASE)
 _FLIGHT_HOURS_PATTERN = rf"\b({_NUMBER_PATTERN})[\s-]*hour[s]?\s*flight"
 _DRIVE_HOURS_PATTERN = rf"\b({_NUMBER_PATTERN})[\s-]*hour[s]?\s*drive"
 
 _WARM_PATTERN = re.compile(r"\bwarm\b|\bhot\b|\btropical\b|\bsunny\b", re.IGNORECASE)
 _BEACH_PATTERN = re.compile(r"\bbeach(?:es)?\b", re.IGNORECASE)
 _POOL_RESORT_PATTERN = re.compile(r"\bpool\b|\bswim[\s-]?up\b|\bresort\b", re.IGNORECASE)
-_FOOD_PATTERN = re.compile(r"food scene|\bculinary\b|\bcuisine\b|\bfoodie\b|great food", re.IGNORECASE)
+_FOOD_PATTERN = re.compile(
+    r"\bfood(?:s|ie|ies)?\b|\bculinary\b|\bcuisine\b|\brestaurants?\b|\bdining\b|\beat(?:ing)?\b",
+    re.IGNORECASE,
+)
+_HIKING_PATTERN = re.compile(r"\bhik(?:e|es|ing|er|ers)\b|\btrek(?:s|king)?\b|\btrails?\b", re.IGNORECASE)
+_LOW_COST_PATTERN = re.compile(
+    r"\bcheap(?:er|est|ly)?\b|\baffordable\b|\binexpensive\b|\blow[\s-]cost\b|\bbudget[\s-]friendly\b"
+    r"|\bon\s+a\s+(?:tight\s+|shoestring\s+)?budget\b|\bshoestring\b",
+    re.IGNORECASE,
+)
 _ENTERTAINMENT_PATTERN = re.compile(
     r"\bentertainment\b|\bnightlife\b|night\s*life|\bbars?\b|\bclubs?\b|live music", re.IGNORECASE
 )
@@ -82,26 +109,50 @@ _AVOID_CULTURAL_PATTERN = re.compile(
 )
 
 
+# Total budget in dollars from the first "$N"/"N USD" mention, or None if none is stated.
+def extract_budget(text: str) -> float | None:
+    for pattern in _BUDGET_PATTERNS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            amount = float(match.group(1).replace(",", ""))
+            return amount * 1000 if match.group(2) else amount
+    return None
+
+
+# Trip length in days ("5 nights", "two weeks", "a weekend"), or None if none is stated.
+def extract_trip_length(text: str) -> int | None:
+    for pattern, multiplier in _TRIP_LENGTH_PATTERNS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            token = match.group(1).lower()
+            count = _to_number(token) if token in _NUMBER_WORDS or token[0].isdigit() else 1
+            return int(count * multiplier)
+    return None
+
+
+# Number of travelers ("4 adults", "family of five"; 1 for "solo"), or None if not stated.
+def extract_traveler_count(text: str) -> int | None:
+    for pattern in _TRAVELER_PATTERNS:
+        count = _extract_number(pattern, text)
+        if count is not None:
+            return int(count)
+    return 1 if _SOLO_PATTERN.search(text) else None
+
+
 def parse_trip_constraints(request_text: str) -> TripConstraints:
     """Deterministically extracts budget/duration/travel-time/vibe constraints from free
     text. Every field is None/False unless the text actually said so -- this never invents
     a number or preference the traveler didn't state.
     """
-    budget = None
-    for pattern in _BUDGET_PATTERNS:
-        match = re.search(pattern, request_text, re.IGNORECASE)
-        if match:
-            budget = float(match.group(1).replace(",", ""))
-            break
-
-    trip_length = _extract_number(_TRIP_LENGTH_PATTERN, request_text)
+    budget = extract_budget(request_text)
+    trip_length = extract_trip_length(request_text)
     flight_hours = _extract_number(_FLIGHT_HOURS_PATTERN, request_text)
     drive_hours = _extract_number(_DRIVE_HOURS_PATTERN, request_text)
 
     return TripConstraints(
         raw_text=request_text,
         budget_usd=budget,
-        trip_length_days=int(trip_length) if trip_length is not None else None,
+        trip_length_days=trip_length,
         max_flight_hours=flight_hours,
         max_drive_hours=drive_hours,
         wants_warm=bool(_WARM_PATTERN.search(request_text)),
@@ -109,7 +160,11 @@ def parse_trip_constraints(request_text: str) -> TripConstraints:
         wants_pool_resort=bool(_POOL_RESORT_PATTERN.search(request_text)),
         wants_food_scene=bool(_FOOD_PATTERN.search(request_text)),
         wants_entertainment=bool(_ENTERTAINMENT_PATTERN.search(request_text)),
+        wants_hiking=bool(_HIKING_PATTERN.search(request_text)),
+        wants_low_cost=bool(_LOW_COST_PATTERN.search(request_text)),
         avoid_cultural=bool(_AVOID_CULTURAL_PATTERN.search(request_text)),
+        travel_month=parse_travel_month(request_text),
+        traveler_count=extract_traveler_count(request_text),
     )
 
 
@@ -211,6 +266,8 @@ _FALLBACK_CANDIDATE_NAMES = [
 _MAX_BRAINSTORMED_NAMES = 25
 
 
+# Turns the model's one-name-per-line reply into a deduplicated list, stripping bullets and
+# numbering and dropping implausibly long lines.
 def _parse_name_list(text: str) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
@@ -229,6 +286,14 @@ def _parse_name_list(text: str) -> list[str]:
     return names
 
 
+# Month name for a 1-12 month number, or None.
+def _month_label(month: int | None) -> str | None:
+    return date(2000, month, 1).strftime("%B") if month else None
+
+
+# Step 2: asks the model for candidate destination names (names only -- nothing it says is
+# trusted as fact). Falls back to _FALLBACK_CANDIDATE_NAMES if the model fails or returns
+# nothing usable. Returns the names and a note on where they came from.
 async def _brainstorm_candidate_names(constraints: TripConstraints, origin_label: str) -> tuple[list[str], str]:
     prompt = dedent(
         f"""
@@ -236,7 +301,9 @@ async def _brainstorm_candidate_names(constraints: TripConstraints, origin_label
         Traveler's request (verbatim): {constraints.raw_text}
         Parsed preferences: warm={constraints.wants_warm}, beach={constraints.wants_beach},
         pool/resort={constraints.wants_pool_resort}, food scene={constraints.wants_food_scene},
-        entertainment/nightlife={constraints.wants_entertainment},
+        entertainment/nightlife={constraints.wants_entertainment}, hiking={constraints.wants_hiking},
+        low cost={constraints.wants_low_cost}, total budget USD={constraints.budget_usd},
+        travel month={_month_label(constraints.travel_month)}, trip length days={constraints.trip_length_days},
         avoid cultural/sightseeing={constraints.avoid_cultural}
 
         List candidate destination names now, one per line, "City, Country" format only.
@@ -261,13 +328,18 @@ async def _brainstorm_candidate_names(constraints: TripConstraints, origin_label
 # Step 4: independently verify every candidate against real data.
 # ---------------------------------------------------------------------------
 
-_OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Search radii: a beach within 6 km counts as "nearby"; restaurants/nightlife are counted within 3 km.
 _BEACH_CHECK_RADIUS_M = 6000
 _POI_DENSITY_RADIUS_M = 3000
-# The public Overpass instance's usage policy asks for non-parallel, non-heavy use. Live
-# testing (2026-09-03) showed that even fully serialized-but-rapid-fire requests from this
-# app tripped its rate limiting; this pacing (used in _attach_beach_and_poi) fixed it.
-_OVERPASS_MIN_INTERVAL_SECONDS = 1.1
+# Result caps match where _score stops rising (20 restaurants, 10 bars), so each check costs one
+# Geoapify credit (1 credit per 20 places) and a count at the cap is shown as "N+".
+_RESTAURANT_CAP = 20
+_NIGHTLIFE_CAP = 10
+_NIGHTLIFE_CATEGORIES = "catering.bar,catering.pub,adult.nightclub"
+# After this many candidates in a row whose place checks all failed, the rest of the shortlist
+# is marked "unavailable" without calling the service. (Added after an Overpass outage where
+# paced calls for 10 candidates took ~143 s and every one failed anyway.)
+_MAX_CONSECUTIVE_PLACE_FAILURES = 2
 # HTTPS, as in the demo server's own documented example query
 # (https://github.com/Project-OSRM/osrm-backend/wiki/Demo-server; verified live 2026-10-09) --
 # plain HTTP would send the traveler's origin/destination coordinates unencrypted.
@@ -279,6 +351,7 @@ _OSRM_MIN_INTERVAL_SECONDS = 1.05
 _OSRM_MAX_DISTANCE_KM = 3500  # beyond this, driving isn't realistic; skip the routing call
 
 
+# Real routed driving time in hours from OSRM, or None if no route was found or the call failed.
 async def _fetch_real_drive_hours(client: httpx.AsyncClient, origin: DestinationCandidate, dest: DestinationCandidate) -> float | None:
     url = f"{_OSRM_URL}/{origin.longitude},{origin.latitude};{dest.longitude},{dest.latitude}"
     try:
@@ -296,44 +369,42 @@ async def _fetch_real_drive_hours(client: httpx.AsyncClient, origin: Destination
         return None
 
 
+# Number of Geoapify places in `categories` within `radius_m` of the destination (at most
+# `cap`), or None if the lookup failed -- so "zero found" and "couldn't check" stay distinct.
+async def _count_places(
+    client: httpx.AsyncClient, dest: DestinationCandidate, categories: str, radius_m: int, cap: int
+) -> int | None:
+    try:
+        places = await search_places(
+            client, categories, latitude=dest.latitude, longitude=dest.longitude, radius_m=radius_m, limit=cap
+        )
+        return len(places)
+    except Exception as ex:
+        logger.warning("Geoapify place check (%s) failed for %s: %s", categories, dest.name, describe_error(ex))
+        return None
+
+
 async def _check_beach_and_poi_density(
     client: httpx.AsyncClient, dest: DestinationCandidate
 ) -> tuple[bool | None, int | None, int | None]:
-    """One combined Overpass query per candidate (beach presence + restaurant count +
-    nightlife count) instead of separate calls -- halves the request volume against the
-    shared public Overpass instance, which matters given its stated no-heavy-usage policy.
+    """Beach presence, restaurant count and nightlife count from Geoapify (OpenStreetMap data),
+    as three capped requests -- 3 credits per candidate. Verified live 2026-10-19: beaches found
+    near Lisbon and Cancun, none near inland Oaxaca City, Denver or Madrid.
     """
-    query = (
-        f"[out:json][timeout:20];"
-        f"("
-        f"node(around:{_BEACH_CHECK_RADIUS_M},{dest.latitude},{dest.longitude})[natural=beach];"
-        f"way(around:{_BEACH_CHECK_RADIUS_M},{dest.latitude},{dest.longitude})[natural=beach];"
-        f");"
-        f"out count;"
-        f'(node(around:{_POI_DENSITY_RADIUS_M},{dest.latitude},{dest.longitude})[amenity=restaurant];);'
-        f"out count;"
-        f'(node(around:{_POI_DENSITY_RADIUS_M},{dest.latitude},{dest.longitude})[amenity~"^(bar|nightclub|pub)$"];);'
-        f"out count;"
-    )
-    try:
-        # max_attempts=2: same reasoning as the OSRM call above -- best-effort signal, bound
-        # the worst case rather than retry a third time against a shared public server.
-        response = await post_with_retry(
-            client, _OVERPASS_URL, data={"data": query},
-            headers={"User-Agent": "agentic-travel-concierge/1.0 (destination discovery)"},
-            max_attempts=2,
-        )
-        elements = response.json().get("elements", [])
-        counts = [int(e.get("tags", {}).get("total", 0)) for e in elements if e.get("type") == "count"]
-        has_beach = counts[0] > 0 if len(counts) > 0 else None
-        restaurant_count = counts[1] if len(counts) > 1 else None
-        nightlife_count = counts[2] if len(counts) > 2 else None
-        return has_beach, restaurant_count, nightlife_count
-    except Exception as ex:
-        logger.warning("Overpass beach/POI check failed for %s: %s", dest.name, describe_error(ex))
-        return None, None, None
+    beach = await _count_places(client, dest, "beach", _BEACH_CHECK_RADIUS_M, 1)
+    restaurants = await _count_places(client, dest, "catering.restaurant", _POI_DENSITY_RADIUS_M, _RESTAURANT_CAP)
+    nightlife = await _count_places(client, dest, _NIGHTLIFE_CATEGORIES, _POI_DENSITY_RADIUS_M, _NIGHTLIFE_CAP)
+    return (beach > 0 if beach is not None else None), restaurants, nightlife
 
 
+# Display label for a capped count: "20+" when the cap was reached.
+def _count_label(count: int | None, cap: int) -> str:
+    return f"{count}+" if count is not None and count >= cap else str(count or 0)
+
+
+# Deterministic ranking score: 1 base point, plus up to 3 for warmth above the threshold
+# (1 per 2 °C), 2 for a beach (when beach/pool was wanted), up to 2 for restaurants (1 per 10)
+# and up to 2 for nightlife (1 per 5). Only preferences the traveler stated count.
 def _score(discovered: DiscoveredDestination, constraints: TripConstraints) -> float:
     score = 1.0
     if constraints.wants_warm and discovered.historical_avg_high_c is not None:
@@ -347,6 +418,9 @@ def _score(discovered: DiscoveredDestination, constraints: TripConstraints) -> f
     return round(score, 2)
 
 
+# Geocodes one brainstormed name and keeps it only if it's within the flight or drive radius
+# (with tolerance). Returns the surviving candidate with distance and estimated travel times,
+# or None if it can't be geocoded or is too far.
 async def _verify_candidate(
     client: httpx.AsyncClient,
     name: str,
@@ -419,41 +493,51 @@ async def _apply_weather(
 async def _attach_beach_and_poi(
     client: httpx.AsyncClient, constraints: TripConstraints, candidates: list[DiscoveredDestination]
 ) -> None:
-    """Sequential, paced Overpass calls (one combined query per candidate) rather than firing
-    the whole shortlist concurrently -- live testing showed even serialized-but-rapid-fire
-    requests trip the shared public Overpass instance's rate limiting, whose usage policy
-    explicitly asks for non-parallel, non-heavy use.
+    """Sequential place checks per candidate (http_utils serializes requests to one host anyway),
+    with a stop after repeated failures so an outage doesn't stall the whole shortlist.
     """
+    consecutive_failures = 0
     for discovered in candidates:
-        has_beach, restaurant_count, nightlife_count = await _check_beach_and_poi_density(client, discovered.destination)
+        if consecutive_failures >= _MAX_CONSECUTIVE_PLACE_FAILURES:
+            has_beach = restaurant_count = nightlife_count = None
+        else:
+            has_beach, restaurant_count, nightlife_count = await _check_beach_and_poi_density(
+                client, discovered.destination
+            )
+            all_failed = has_beach is None and restaurant_count is None and nightlife_count is None
+            consecutive_failures = consecutive_failures + 1 if all_failed else 0
         discovered.has_beach_nearby = has_beach
         discovered.restaurant_count_nearby = restaurant_count
         discovered.nightlife_count_nearby = nightlife_count
 
         if has_beach is None:
-            discovered.caveats.append("Could not check OpenStreetMap for nearby beaches (data source unavailable).")
+            discovered.caveats.append("Could not check for nearby beaches (place data unavailable).")
         elif has_beach:
-            discovered.rationale.append("A beach is tagged within 6 km in OpenStreetMap data.")
+            discovered.rationale.append("A beach is mapped within 6 km (OpenStreetMap data via Geoapify).")
         elif constraints.wants_beach or constraints.wants_pool_resort:
             discovered.caveats.append(
-                "No beach tagged within 6 km in OpenStreetMap data -- it may still have one; "
+                "No beach mapped within 6 km in OpenStreetMap data -- it may still have one; "
                 "OSM coverage varies by region, so this isn't a confirmed absence."
             )
 
         if restaurant_count is None and nightlife_count is None:
-            discovered.caveats.append(
-                "Could not check OpenStreetMap for nearby restaurants/nightlife (data source unavailable)."
-            )
+            discovered.caveats.append("Could not check for nearby restaurants/nightlife (place data unavailable).")
         else:
             discovered.rationale.append(
-                f"{restaurant_count or 0} restaurants and {nightlife_count or 0} bars/nightlife venues "
-                f"found within 3 km in OpenStreetMap data."
+                f"{_count_label(restaurant_count, _RESTAURANT_CAP)} restaurants and "
+                f"{_count_label(nightlife_count, _NIGHTLIFE_CAP)} bars/pubs/nightclubs mapped within 3 km "
+                "(OpenStreetMap data via Geoapify)."
             )
+        if constraints.wants_hiking:
+            # No hiking-route data in Geoapify (no such category; a nature-area count was tested
+            # 2026-10-19 and scored flat Amsterdam the same as Innsbruck), so this isn't scored.
+            discovered.caveats.append("Hiking trails aren't checked automatically -- verify trail access yourself.")
 
         discovered.score = _score(discovered, constraints)
-        await asyncio.sleep(_OVERPASS_MIN_INTERVAL_SECONDS)
 
 
+# Replaces each candidate's estimated drive time with a real OSRM route time, sequentially and
+# paced per OSRM's usage policy; candidates too far to drive keep the estimate, with a caveat.
 async def _attach_real_drive_times(
     client: httpx.AsyncClient, origin: DestinationCandidate, candidates: list[DiscoveredDestination]
 ) -> None:
@@ -493,8 +577,12 @@ async def discover_destinations(
     end_date: date,
     *,
     max_results: int = _MAX_RESULTS,
+    constraints: TripConstraints | None = None,
 ) -> DestinationDiscoveryResult:
-    constraints = parse_trip_constraints(request_text)
+    """`constraints` lets the caller pass what intake already understood (including
+    LLM-recovered, verified values -- see request_understanding.py); parsed from the text
+    when omitted."""
+    constraints = constraints or parse_trip_constraints(request_text)
 
     origin_matches = await geocode_candidates(client, origin_city, count=1)
     if not origin_matches:

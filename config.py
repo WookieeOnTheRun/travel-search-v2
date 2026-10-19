@@ -63,6 +63,9 @@ def _env(name: str, default: str) -> str:
     return os.getenv(name, "").strip() or default
 
 
+# Every setting the app reads from the environment, resolved once at import into the `settings`
+# singleton below. Variables are documented in .env.example; secrets default to "" (the feature
+# that needs them then reports itself unavailable instead of failing at startup).
 @dataclass(slots=True)
 class Settings:
     # Ollama's cloud-hosted API (verified against https://docs.ollama.com/api/authentication
@@ -81,6 +84,8 @@ class Settings:
     # the Streamlit UI, and never paste a real value into chat, a PR, or an issue.
     ollama_api_key: str = os.getenv("OLLAMA_API_KEY", "")
 
+    # Optional extra JSON endpoints (comma-separated URLs) queried for grounding snippets; see
+    # data_sources._fetch_external_api_snippets. Empty = none.
     travel_api_endpoints: List[str] = field(
         default_factory=lambda: [
             endpoint.strip()
@@ -88,13 +93,25 @@ class Settings:
             if endpoint.strip()
         ]
     )
+    # Bearer token sent only to TRAVEL_API_ENDPOINTS. Secret.
     travel_api_key: str = os.getenv("TRAVEL_API_KEY", "")
-    rapidapi_key: str = os.getenv("RAPIDAPI_KEY", os.getenv("TRAVEL_API_KEY", ""))
+    # One RapidAPI key, sent to every RapidAPI host below (Booking.com, visa). Secret.
+    # No fallback to TRAVEL_API_KEY: that key belongs to the operator's own endpoints and would
+    # otherwise be sent to RapidAPI hosts whenever RAPIDAPI_KEY is unset.
+    rapidapi_key: str = os.getenv("RAPIDAPI_KEY", "")
+    # Read timeout (seconds) for outbound HTTP calls; connects always time out after 5 s (see
+    # http_utils.DEFAULT_HTTP_TIMEOUT). Destination discovery uses its own fixed timeout.
     request_timeout_seconds: float = float(_env("REQUEST_TIMEOUT_SECONDS", "20"))
 
+    # Currency (ISO 4217) for hotel/flight prices, and locale for result language.
     default_currency: str = _env("DEFAULT_CURRENCY", "USD")
     default_locale: str = _env("DEFAULT_LOCALE", "en-US")
+    # Passport country (ISO 3166-1 alpha-2) assumed for visa-requirement lookups.
     default_citizenship_country_code: str = _env("DEFAULT_CITIZENSHIP_COUNTRY_CODE", "US")
+
+    # Geoapify Places API key (https://myprojects.geoapify.com) -- place data for discovery and
+    # sightseeing (see travel_agent/geoapify.py). Without it those checks report "unavailable".
+    geoapify_api_key: str = os.getenv("GEOAPIFY_API_KEY", "")
 
     # Each of these hosts + the fixed endpoint paths in travel_agent/location_resolution.py
     # and travel_agent/data_sources.py were verified against the live RapidAPI products on
@@ -124,4 +141,5 @@ class Settings:
     )
 
 
+# The process-wide settings instance every module imports.
 settings = Settings()

@@ -5,6 +5,7 @@ import csv
 import io
 import logging
 import re
+import unicodedata
 from datetime import date, datetime
 
 import httpx
@@ -22,57 +23,194 @@ logger = logging.getLogger(__name__)
 # Destination candidates (natural language -> disambiguated place options)
 # ---------------------------------------------------------------------------
 
+_MONTH_NUMBERS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7,
+    "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9,
+    "oct": 10, "nov": 11, "dec": 12,
+}
+
+# Capitalized words that are never a destination on their own. Month names are the important
+# ones: "a week in March" used to geocode to March, Afghanistan/England/Austria, and "in April"
+# to Aprilia, Italy (both verified live, 2026-10-19). The rest are sentence-starters and filler
+# that would otherwise be picked up as a leading place name ("Plan a trip...", "Somewhere warm").
+_NON_PLACE_WORDS = frozenset(
+    set(_MONTH_NUMBERS)
+    | {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+    | {"christmas", "easter", "thanksgiving", "halloween"}
+    | {
+        "i", "i'd", "i'm", "we", "we'd", "we're", "my", "our", "me", "us", "you", "a", "an", "the",
+        "to", "in", "visit", "visiting", "or", "and", "for", "from", "not", "maybe", "hi", "hello", "hey",
+        "please", "somewhere", "anywhere", "plan", "planning", "looking", "want", "need", "help", "find",
+        "book", "going", "heading", "thinking", "trip", "vacation", "holiday", "getaway", "weekend", "week",
+    }
+)
+
+_PLACE_PATTERN = r"[A-ZÀ-Þ][\w'\-]*(?:\s+(?:(?:de|del|da|do|di|la|le|of)\s+)?[A-ZÀ-Þ][\w'\-]*)*"
+_PHRASE_PATTERN = rf"({_PLACE_PATTERN})(?:\s*,\s*({_PLACE_PATTERN}))?"
+
 _DESTINATION_HINT_PATTERNS = [
-    re.compile(r"\bto\s+(?:the\s+)?([A-Z][a-zA-Z\-]*(?:\s+[A-Z][a-zA-Z\-]*)*)"),
-    re.compile(r"\bin\s+(?:the\s+)?([A-Z][a-zA-Z\-]*(?:\s+[A-Z][a-zA-Z\-]*)*)"),
-    re.compile(r"\bvisit(?:ing)?\s+(?:the\s+)?([A-Z][a-zA-Z\-]*(?:\s+[A-Z][a-zA-Z\-]*)*)"),
+    re.compile(rf"\b(?:to|in|visit(?:ing)?|or)\s+(?:the\s+)?{_PHRASE_PATTERN}"),
+    # A place named first, with no preposition: "Lisbon, Portugal, 5 nights..." / "Tokyo for 4 nights".
+    re.compile(rf"^\s*{_PHRASE_PATTERN}"),
 ]
+# "Seattle to Honolulu": a leading place followed by "to <Place>" is the origin, not the destination.
+_LEADING_ORIGIN_PATTERN = re.compile(r"\s*(?:to|->|→)\s+[A-ZÀ-Þ]")
 
 
-def extract_destination_phrases(request_text: str, *, max_phrases: int = 3) -> list[str]:
+def _clean_place_phrase(phrase: str | None) -> str:
+    """Drops non-place words from the start of a phrase, then cuts it at the next one --
+    "To Lisbon" -> "Lisbon", "Lisbon May" -> "Lisbon", "March" -> ""."""
+    if not phrase:
+        return ""
+    tokens = phrase.split()
+    while tokens and tokens[0].lower() in _NON_PLACE_WORDS:
+        tokens.pop(0)
+    kept: list[str] = []
+    for token in tokens:
+        if token.lower() in _NON_PLACE_WORDS:
+            break
+        kept.append(token)
+    return " ".join(kept)
+
+
+def extract_destination_phrases(request_text: str, *, max_phrases: int = 4) -> list[str]:
     """Pulls candidate place-name phrases out of free text for geocoding.
 
     This is a heuristic, not a resolver -- it only has to be good enough to
-    produce *candidates* for the user to confirm, unlike the old single-shot
-    regex extractor that picked one destination and used it directly. Multiple
-    patterns are tried and merged so one missed phrasing doesn't lose the
-    destination entirely.
+    produce *candidates*, which resolve_destination_phrases then checks against
+    real geocoding data before anything is offered to the user. A trailing
+    capitalized qualifier is kept as "Place, Qualifier" ("Cancun, Mexico") so the
+    resolver can use it to pick the right same-named place.
     """
     phrases: list[str] = []
     for pattern in _DESTINATION_HINT_PATTERNS:
         for match in pattern.finditer(request_text):
-            phrase = match.group(1).strip()
-            if phrase and phrase not in phrases:
+            if pattern is _DESTINATION_HINT_PATTERNS[-1] and _LEADING_ORIGIN_PATTERN.match(request_text, match.end(1)):
+                continue
+            head = _clean_place_phrase(match.group(1))
+            if not head:
+                continue
+            qualifier = _clean_place_phrase(match.group(2))
+            phrase = f"{head}, {qualifier}" if qualifier else head
+            if phrase not in phrases:
                 phrases.append(phrase)
     return phrases[:max_phrases]
 
 
-async def resolve_destination_candidates(
-    client: httpx.AsyncClient, request_text: str, *, max_candidates: int = 6
-) -> list[DestinationCandidate]:
-    """End-to-end: pull place-name phrases out of free text, geocode each one,
-    and merge into a deduplicated candidate list for the user to pick from.
+def fold_text(text: str) -> str:
+    """Lowercase + strip accents, so "Cancun" matches the geocoder's "Cancún"."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower().strip()
+
+
+# True for words the geocoder would happily match to a hamlet but that aren't places here
+# (see _NON_PLACE_WORDS).
+def is_non_place_word(text: str) -> bool:
+    return fold_text(text) in _NON_PLACE_WORDS
+
+
+# Feature codes (GeoNames, as returned by Open-Meteo's geocoder) that are destinations on their
+# own: capitals and countries. Anything else must clear the population floor below.
+_ALWAYS_PLAUSIBLE_FEATURE_CODES = frozenset({"PPLC", "PCL", "PCLI", "PCLD", "PCLF", "PCLS", "PCLIX", "TERR"})
+# Population floor for an unqualified name to be offered automatically. A design choice, checked
+# against live geocoder rows (2026-10-19): it keeps Sedona (10,388), Tulum (18,233) and Key West
+# (25,755) and drops the hamlets a bare word lands on (Beach, ND: 1,115; March, Salzburg: 308).
+# Smaller places still get through when their country/state is named ("Hallstatt, Austria").
+_MIN_PLAUSIBLE_POPULATION = 10_000
+# Common country names/abbreviations -> the ISO code the geocoder reports.
+_QUALIFIER_ALIASES = {"usa": "us", "united states of america": "us", "america": "us", "uk": "gb", "britain": "gb"}
+
+
+# Whether a stated qualifier ("Portugal", "TX", "UK") names the candidate's country,
+# country code, or state/region.
+def _qualifier_matches(candidate: DestinationCandidate, qualifier: str) -> bool:
+    q = fold_text(qualifier)
+    q = _QUALIFIER_ALIASES.get(q, q)
+    return q in {fold_text(candidate.country), candidate.country_code.lower(), fold_text(candidate.admin1 or "")}
+
+
+# A capital/country, or a place above the population floor -- see the constants above.
+def _is_plausible_destination(candidate: DestinationCandidate) -> bool:
+    return (candidate.feature_code or "") in _ALWAYS_PLAUSIBLE_FEATURE_CODES or (
+        (candidate.population or 0) >= _MIN_PLAUSIBLE_POPULATION
+    )
+
+
+# "Name, Region, Country (population N)" -- how a geocoder match is described in parsing notes.
+def _describe_match(candidate: DestinationCandidate) -> str:
+    population = f"population {candidate.population:,}" if candidate.population else "no population on record"
+    return f"{candidate.label} ({population})"
+
+
+async def resolve_destination_phrases(
+    client: httpx.AsyncClient,
+    phrases: list[str],
+    *,
+    strict: bool = True,
+    per_phrase: int = 3,
+) -> tuple[list[DestinationCandidate], list[str]]:
+    """Geocodes each "Place" / "Place, Qualifier" phrase and keeps only matches that are
+    really that place (the geocoder prefix-matches: "Trip" returns Tripoli, "Plan" returns
+    Plano) and plausibly a destination. Returns (candidates, notes explaining each rejection).
+
+    strict=False is for names an LLM pulled out of the request and that were already checked
+    against the request text: the exact-name match is still required, but the best match is
+    kept even when it's small.
     """
-    phrases = extract_destination_phrases(request_text)
-    if not phrases:
-        return []
-
-    results_lists = await asyncio.gather(*(geocode_candidates(client, phrase, count=3) for phrase in phrases))
-
+    notes: list[str] = []
+    pending = [p for p in phrases if p]
     merged: list[DestinationCandidate] = []
     seen: set[tuple[str, str]] = set()
-    for candidates in results_lists:
-        for candidate in candidates:
-            key = (candidate.name.lower(), candidate.country_code)
-            if key not in seen:
-                seen.add(key)
-                merged.append(candidate)
 
-    return merged[:max_candidates]
+    while pending:
+        heads = [p.partition(",") for p in pending]
+        results_lists = await asyncio.gather(
+            *(geocode_candidates(client, head.strip(), count=10, raise_errors=True) for head, _, _ in heads),
+            return_exceptions=True,
+        )
+        retry: list[str] = []
+        for (head, _, qualifier), results in zip(heads, results_lists):
+            head, qualifier = head.strip(), qualifier.strip()
+            if isinstance(results, Exception):
+                notes.append(f"Couldn't look up {head!r} right now ({describe_error(results)}).")
+                continue
+            exact = [c for c in results if fold_text(c.name) == fold_text(head)]
+            if not exact:
+                notes.append(f"Ignored {head!r}: no place with exactly that name was found.")
+                continue
+
+            keep: list[DestinationCandidate] = []
+            if qualifier:
+                qualified = [c for c in exact if _qualifier_matches(c, qualifier)]
+                if qualified:
+                    keep = [qualified[0]] + [c for c in qualified[1:] if _is_plausible_destination(c)]
+                else:
+                    # "Lisbon, Porto": the "qualifier" is really a second place.
+                    retry.append(qualifier)
+            if not keep:
+                keep = [c for c in exact if _is_plausible_destination(c)]
+                if not keep and not strict:
+                    keep = exact[:1]
+            if not keep:
+                notes.append(
+                    f"Ignored {head!r}: the closest real match, {_describe_match(exact[0])}, "
+                    "doesn't look like a travel destination."
+                )
+                continue
+
+            for candidate in keep[:per_phrase]:
+                key = (fold_text(candidate.name), candidate.country_code)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(candidate)
+        pending = retry
+
+    return merged, notes
 
 
 async def geocode_candidates(
-    client: httpx.AsyncClient, destination_text: str, *, count: int = 5
+    client: httpx.AsyncClient, destination_text: str, *, count: int = 5, raise_errors: bool = False
 ) -> list[DestinationCandidate]:
     """Resolves free-text destination wording into ranked, disambiguated place
     options via Open-Meteo's public geocoding API (no key required).
@@ -82,6 +220,9 @@ async def geocode_candidates(
     would) is exactly the reliability gap this function replaces. Callers are
     expected to have the user confirm one candidate before it's used to resolve
     any provider-specific code.
+
+    A failed lookup returns [] (same as "no match") unless raise_errors=True, for callers that
+    need to tell the user which of the two happened.
     """
     if not destination_text.strip():
         return []
@@ -94,6 +235,8 @@ async def geocode_candidates(
         results = response.json().get("results") or []
     except Exception as ex:
         logger.warning("Geocoding failed for %r: %s", destination_text, describe_error(ex))
+        if raise_errors:
+            raise
         return []
 
     candidates: list[DestinationCandidate] = []
@@ -112,6 +255,8 @@ async def geocode_candidates(
                 admin1=entry.get("admin1"),
                 latitude=float(latitude),
                 longitude=float(longitude),
+                feature_code=entry.get("feature_code"),
+                population=entry.get("population"),
             )
         )
     return candidates
@@ -171,6 +316,31 @@ def parse_travel_start_date(request_text: str, *, today: date | None = None) -> 
     return parsed_date
 
 
+# A month named with no day ("a week in March", "mid-June"). Requires a preceding time word so
+# the modal verb "may" ("I may go...") isn't read as May, and a following number is excluded
+# so "March 5" is left to parse_travel_start_date.
+_MONTH_ONLY_PATTERN = re.compile(
+    rf"\b(?:in|during|for|this|next|early|mid|late|around|by|end\s+of)[\s-]+(?:of\s+)?({_MONTH_NAMES})\b(?!\.?\s*\d)",
+    re.IGNORECASE,
+)
+
+
+# Month number (1-12) when the request names a travel month without a day ("in March"), else None.
+def parse_travel_month(request_text: str) -> int | None:
+    match = _MONTH_ONLY_PATTERN.search(request_text)
+    return _MONTH_NUMBERS[match.group(1).lower()] if match else None
+
+
+def month_window_start(month: int, *, today: date | None = None) -> date:
+    """The 1st of the next occurrence of `month` (or today, if we're already in it) -- a
+    stand-in start date for a month-only request; the user is shown it and can change it."""
+    today = today or date.today()
+    if month == today.month:
+        return today
+    year = today.year if month > today.month else today.year + 1
+    return date(year, month, 1)
+
+
 # ---------------------------------------------------------------------------
 # Airport code resolution (OurAirports public dataset, by great-circle distance)
 #
@@ -203,6 +373,7 @@ _RELEVANT_AIRPORT_TYPES = {"large_airport", "medium_airport"}
 _airports_cache: list[dict[str, str]] | None = None
 
 
+# The OurAirports rows for large/medium airports with an IATA code, downloaded once per process.
 async def _load_airports_dataset(client: httpx.AsyncClient) -> list[dict[str, str]]:
     global _airports_cache
     if _airports_cache is not None:
@@ -287,6 +458,7 @@ async def resolve_origin_airport_codes(client: httpx.AsyncClient, origin_city_te
 # ---------------------------------------------------------------------------
 
 
+# The Booking.com flight location id for an IATA code, or None if unavailable or unmatched.
 async def resolve_booking_flight_location_id(client: httpx.AsyncClient, iata_code: str) -> str | None:
     if not settings.rapidapi_key or not iata_code:
         return None
@@ -364,6 +536,7 @@ async def resolve_origin_flight_location(
 # ---------------------------------------------------------------------------
 
 
+# The (dest_id, search_type) pair for the destination, or (None, None) if unavailable.
 async def resolve_booking_hotel_destination(
     client: httpx.AsyncClient, candidate: DestinationCandidate
 ) -> tuple[str, str] | tuple[None, None]:

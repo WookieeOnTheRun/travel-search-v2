@@ -59,13 +59,13 @@ around with no working data source.
 
 As soon as a destination + travel date are confirmed on the "confirm" screen -- before
 itinerary generation -- three checks run automatically and render directly on that screen,
-each from a source verified live (2026-09-03), no API key required for any of them:
+each from a source verified live (2026-09-03; activities source replaced 2026-10-19):
 
 | Check | Source | Behavior |
 |---|---|---|
 | Safety advisory | U.S. Dept. of State (`cadataapi.state.gov/api/TravelAdvisories`) | An obvious red banner appears if the destination's country has a Level 3 ("Reconsider Travel") or Level 4 ("Do Not Travel") advisory published/updated in the last 6 months. |
 | Weather outlook | Open-Meteo Historical Weather API (`archive-api.open-meteo.com`) + standard Forecast API (`api.open-meteo.com`) | Average highs/lows for the trip's calendar window, averaged across the last 3 fully-elapsed years. If departure is within 14 days, an actual forecast for that window is also shown (forecast API covers up to 16 days out). |
-| Activities & sightseeing | OpenStreetMap Overpass API (`overpass-api.de/api/interpreter`) | Nearby named tourism/historic points of interest, each annotated with a best-effort comment on whether its listed `opening_hours` cover the trip's travel months. |
+| Activities & sightseeing | OpenStreetMap data via the Geoapify Places API (`api.geoapify.com/v2/places`, needs `GEOAPIFY_API_KEY`), plus Wikidata (`www.wikidata.org/w/api.php`, no key) for notability | Two lists of nearby named points of interest: **Most notable** (covered by 8+ Wikipedia language editions, per Wikidata sitelinks) and **Lesser-known, worth considering** (less documented, but with a concrete signal such as a Wikidata/Wikipedia entry, heritage listing, website or listed hours). Both are ranked toward sightseeing interests named in the request (history, art, museums, religious sites, parks & nature, views, family & kids, theater, architecture; negated phrases like "no museums" are ignored), each with a reason it was listed and a best-effort comment on whether its `opening_hours` cover the trip's travel months. |
 
 The same State Department check also now grounds the final itinerary's safety section in
 `data_sources.py` (replacing the previous third-party `travel-advisory.info` aggregator),
@@ -78,8 +78,11 @@ attractions/things-to-do endpoint before reaching for OpenStreetMap: over a doze
 paths (`attractions/searchAttractions`, `attraction/searchLocation`, `poi/searchLocation`,
 `tours/searchLocation`, `thingstodo/searchLocation`, etc.) were probed against the live API
 and every one 404'd, and its sibling `restaurant/*` endpoints that do exist were failing
-server-side too. OpenStreetMap's Overpass API needs no key, is well-documented, and was
-verified live to return real, named points of interest with usable tags.
+server-side too. OpenStreetMap data was used instead -- first via the public Overpass API,
+then (2026-10-19) via Geoapify, after Overpass's public instance was verified to be at capacity
+for automated use (502 "at capacity" or 35-70 s queues on every call; its operators propose
+about 50 requests/day per application as a fair share). Geoapify returns the same OSM places
+with their original tags, including `opening_hours`.
 
 ## Destination discovery (`travel_agent/destination_discovery.py`)
 
@@ -118,17 +121,19 @@ The pipeline is deliberately split so an LLM only ever proposes *names*, never *
      averages for the requested dates; candidates below the app's documented warm-weather
      threshold (24°C/75°F average high -- a stated design choice, not an external authority)
      are dropped when warmth was requested.
-   - **Beach / food scene / nightlife**: a single combined OpenStreetMap Overpass query per
-     candidate counts nearby beaches, restaurants, and bars/nightclubs -- real counts, used
-     both as rationale text and as scoring signal, never asserted without a successful check.
+   - **Beach / food scene / nightlife**: three capped Geoapify Places requests per candidate
+     (OpenStreetMap data, 1 credit each) check for a beach within 6 km and count restaurants and
+     bars/pubs/nightclubs within 3 km, up to where the score stops rising (20 and 10) -- real
+     counts, used both as rationale text and as scoring signal, never asserted without a
+     successful check. Hiking preference guides the destination brainstorm but isn't scored:
+     Geoapify has no hiking-route data.
 4. Surviving candidates are ranked by a deterministic, documented scoring formula (warmth
    margin + beach match + food/nightlife density) and the top few are shown for the user to
    pick from; picking one carries it into the normal confirm -> itinerary flow.
 
-**Public-API courtesy and latency.** OSRM's demo server and Overpass's public instance both
-publish no-heavy-usage policies (OSRM: 1 request/second; Overpass: no parallel querying).
-Both are called sequentially with explicit pacing for the bounded post-filter shortlist,
-never fired concurrently across candidates. Just as important: the `httpx` client used for
+**Public-API courtesy and latency.** OSRM's demo server publishes a 1 request/second policy
+and Geoapify's free plan allows 5 requests/second; both are called sequentially for the bounded
+post-filter shortlist, never fired concurrently across candidates (OSRM with explicit pacing). Just as important: the `httpx` client used for
 discovery sets a short, explicit *connect* timeout (5s) separate from the read timeout --
 live testing during development showed that a flat single timeout value turns one slow/dead
 connection attempt, multiplied across the retry budget and every candidate, into a
@@ -171,7 +176,9 @@ public service) bounded to a couple of minutes while leaving normal operation un
 
 ## Configure
 
-1. Copy `travel_agent/main.env` (or create `.env`) and set:
+1. Copy `travel_agent/main.env.example` to `travel_agent/main.env` (or `.env.example` to
+   `.env`) and set the values below. Both templates explain every variable -- what it does,
+   its default, and which ones are secrets.
 
 ```env
 OLLAMA_MODEL=gemma4:cloud
@@ -179,6 +186,7 @@ OLLAMA_HOST=https://ollama.com
 OLLAMA_API_KEY=
 
 RAPIDAPI_KEY=
+GEOAPIFY_API_KEY=
 
 RAPIDAPI_BOOKING_HOST=booking-com15.p.rapidapi.com
 RAPIDAPI_VISA_HOST=visa-requirement.p.rapidapi.com
@@ -200,6 +208,12 @@ and falls back to the built-in default, so `.env.example` can be copied as-is.
 `RAPIDAPI_KEY` is a RapidAPI application key subscribed to the Booking.com
 (`booking-com15.p.rapidapi.com`) and Visa Requirements products -- get one from your RapidAPI
 dashboard.
+
+`GEOAPIFY_API_KEY` is a [Geoapify](https://www.geoapify.com/pricing) Places API key (free plan:
+3,000 credits/day). It supplies the beach/restaurant/nightlife checks in destination discovery
+and the optional sightseeing list, from OpenStreetMap data; without it those checks show as
+unavailable. The free plan requires "Powered by Geoapify" and OpenStreetMap attribution, which
+the UI shows next to that data.
 
 Only the RapidAPI **host** is configurable per RapidAPI provider -- endpoint paths are
 fixed, verified constants in code. A RapidAPI host maps 1:1 to one product's route
@@ -300,6 +314,18 @@ sidebar:
   names as Markdown, and this rule is what keeps a name from carrying a link or an image). Nothing is written to the database for a search that is never saved; "Start
   over" discards it. The same result can be saved to more than one itinerary. A search is
   only ever stored together with its itinerary link, in a single transaction.
+- **Search context.** Each saved search also stores the request behind it -- request text,
+  origin, trip length, travelers, budget, start date, the confirmed destination and the
+  sightseeing setting -- shown as **Search details** in the itinerary views. Searches saved
+  before this was recorded show no details.
+- **Starting over.** "Start over" (and "Back" during a search) discards everything from the
+  search in progress -- request, parsed details, destination checks, results and screen
+  selections -- so the next search starts from scratch. Saved itineraries are untouched.
+- **Refining a saved search.** **Refine this search** on a saved search starts a new search
+  with the intake form pre-filled from it (and its start date reused if the edited request
+  names none). The search stays scoped to that itinerary: the results screen notes where it
+  came from, and the save form defaults to that itinerary. "Cancel refining" or "Start over"
+  drops the scope.
 - **Viewing.** Each itinerary has its own button in the sidebar (opens that itinerary and its
   saved searches). **All itineraries** lists every itinerary in the session together, each
   with its saved searches and an Open button. Saved searches are snapshots: prices and
